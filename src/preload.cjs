@@ -36,7 +36,7 @@
 // not defined`, which Chromium reports as "Unable to load preload script".
 // Verified against this runtime: `require('electron').contextBridge` succeeds
 // where the bare global throws.
-const { contextBridge: contextBridgeApi, ipcRenderer: ipcRendererApi } = require('electron')
+const { contextBridge: contextBridgeApi, ipcRenderer: ipcRendererApi, webUtils } = require('electron')
 
 if (!contextBridgeApi || !ipcRendererApi) {
   throw new Error('preload: Electron contextBridge/ipcRenderer are not available')
@@ -50,7 +50,31 @@ contextBridgeApi.exposeInMainWorld('__dshPreloadProbe', {
   loaded: true,
   hasContextBridge: contextBridgeApi !== undefined,
   hasIpcRenderer: ipcRendererApi !== undefined,
+  hasWebUtils: webUtils !== undefined,
 })
+
+// Resolves a dropped or pasted `File` to the path on this machine.
+//
+// A file that came from a file manager has one, and the application can then
+// refer to it as `@/path/to/file` instead of uploading its bytes — which is the
+// difference between attaching a 4 GB build artifact and failing to attach
+// anything. A file that came from a paste or a drag out of another page has no
+// path, so this returns an empty string and the caller uploads it as usual.
+contextBridgeApi.exposeInMainWorld('__DSH_HOST_PATHS__', Object.freeze({
+  /**
+   * @param {File} file - a `File` from a drop or paste event
+   * @returns {string} the absolute path, or '' when the file has none
+   */
+  pathFor(file) {
+    try {
+      // `getPathForFile` throws on a File that did not come from the OS, so a
+      // wrong argument must not take the page down with it.
+      return file instanceof File ? (webUtils.getPathForFile(file) ?? '') : ''
+    } catch {
+      return ''
+    }
+  },
+}))
 console.log('[dsh-shell] preload loaded; contextBridge =', typeof contextBridgeApi,
   'ipcRenderer =', typeof ipcRendererApi)
 // Also hand the mark to the main process over IPC: the renderer console is not
@@ -59,6 +83,17 @@ console.log('[dsh-shell] preload loaded; contextBridge =', typeof contextBridgeA
 ipcRendererApi.send('shell:preload-probe', {
   contextBridge: typeof contextBridgeApi,
   ipcRenderer: typeof ipcRendererApi,
+})
+
+// Receives the page's theme choice so the main process can keep Electron's own
+// chrome in step. Called by the script `theme-bridge.js` injects; exposed
+// separately from `shell` because the page reads it, not the application.
+contextBridgeApi.exposeInMainWorld('__dshSetTheme', (/** @type {unknown} */ value) => {
+  try {
+    ipcRendererApi.send('shell:theme', { source: value === null || value === undefined ? null : String(value) })
+  } catch {
+    // intentionally empty
+  }
 })
 
 contextBridgeApi.exposeInMainWorld('shell', Object.freeze({
@@ -144,7 +179,23 @@ contextBridgeApi.exposeInMainWorld('shell', Object.freeze({
    * @param {(state: object) => void} handler
    * @returns {() => void} unsubscribe
    */
-  onState(handler) {
+  /**
+   * Subscribes to the update state, so the page can show the same thing the
+   * tray line shows rather than a second guess at it.
+   *
+   * @param {(state: object) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onUpdate(/** @type {(state: object) => void} */ handler) {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (/** @type {unknown} */ _event, /** @type {any} */ state) => {
+      try { handler(state) } catch { /* ignore renderer errors */ }
+    }
+    ipcRendererApi.on('shell:update', listener)
+    return () => ipcRendererApi.removeListener('shell:update', listener)
+  },
+
+  onState(/** @type {(state: object) => void} */ handler) {
     if (typeof handler !== 'function') return () => {}
     const listener = (/** @type {unknown} */ _event, /** @type {any} */ state) => {
       try { handler(state) } catch { /* ignore renderer errors */ }
