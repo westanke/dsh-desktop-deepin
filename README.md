@@ -114,7 +114,8 @@ deb 里**只有壳的代码**，不含 Electron（约 364 MB）、Node（约 25 
 | 插件把内核搞崩，壳自己进不去、也没法卸插件（死锁） | **安全模式**：停用全部第三方 bundle，用户 patch 层备份改名，且不持久化 |
 | 内核非正常退出后，`npm exec` 拉起的 MCP 服务器被 init 收养、永远活着 | **孤儿收割**：给内核注入进程印记，退出后扫描 `/proc` 按印记收割整棵进程树（24 个单测） |
 | 端口开着但其实不是我们的内核 | **就绪判定必须拿到真实 HTTP 响应**，端口占用不算 |
-| 崩溃后一片空白 | 崩溃报告落盘（保留最新 10 份）+ 日志进缓冲区即脱敏 + 渲染进程 60 秒内自愈 3 次 |
+| 崩溃后一片空白 | 崩溃报告落盘（保留最新 10 份、目录 0700 文件 0600、同毫秒不覆盖）+ 日志进缓冲区即脱敏 + 渲染进程 60 秒内自愈 3 次 |
+| 内核反复退出，窗口里只剩一张错误页 | **原生恢复对话框**：报告先落盘再弹窗（写入上限 1 秒，慢盘不把人扣住），给「退出 / 重启 / 禁用第三方插件并重启」三条路；端口占用单独识别——那是另一个 dsh 还在跑，不是插件问题，所以那条路上不提供「禁用插件」 |
 
 ### 供应链可验证，且失败时不静默
 
@@ -267,7 +268,9 @@ bash /opt/deepseek-harness-desktop/tools/install-plugins.sh force    # 全部重
 | 进程组整体回收 | `src/kernel-process.js` | Unix 下子进程自任组长，退出时 `kill(-pid)` 连孙进程一起收 |
 | 系统内核模式 | `src/main.js` `resolveKernelPaths` | 设 `DSH_KERNEL_BIN` 即可驱动系统已装的 `dsh`，用真 Node 跑 |
 | 固定端口 | `src/main.js` `preferredPort` | 默认 `19387`（官方同款）；被占用则自动退回随机端口 |
-| 崩溃报告 | `src/diagnostics.js` | 写 `userData/logs/crash-<UTC>-<来源>.log`，保留最新 10 份，输出限 64 KiB |
+| 崩溃报告 | `src/diagnostics.js` | 写 `userData/logs/crash-<UTC>-<来源>.log`，保留最新 10 份，输出限 64 KiB；目录 0700 文件 0600，`wx` 拒绝覆盖 |
+| 崩溃恢复对话框 | `src/fatal-recovery.js` | 先落盘报告再弹窗（上限 1 秒）；详情截 1200 字留末 8 行、按码点切不截断代理对；三分支按钮，恢复失败重新询问而非退出；一次进程只弹一次 |
+| 终端里也能用 | `src/login-shell-environment.js` `src/cli-command.js` | GUI 启动只继承会话管理器变量，所以启动前读一次登录 shell（`-ilc` + NUL 定界，10 秒上限，失败即回落继承环境）；`dsh` 命令可装到 `~/.local/bin`，带指纹记账，只动能证明是自己装的那一个 |
 | 多个内核 Home | `src/dsh-home-manager.js` | 可登记多个 `DSH_HOME` 并在托盘切换；注册表存 `userData/dsh-homes.json`，刻意放在所有 Home 之外 |
 | 命令行指定 Home | `src/dsh-home-manager.js` | `--dsh-home=<路径>` 直接用某个目录启动，优先级高于一切 remembered 选择；适合做多个快捷方式 |
 
@@ -277,8 +280,10 @@ bash /opt/deepseek-harness-desktop/tools/install-plugins.sh force    # 全部重
 |---|---|---|
 | 应用菜单 | `src/app-menu.js` | 应用/文件/编辑/视图/窗口 五组；首项「关于」开原生面板 |
 | DevTools 快捷键 | `src/app-menu.js` | F12 与 Ctrl+Shift+I，注册为隐藏菜单项，打包版同样有效 |
-| 系统托盘 | `src/tray.js` | 显示/隐藏/重启内核/**切换 Home**/检查更新/安全模式/开机自启/退出，带实时状态行 |
-| 关闭即隐藏 | `src/tray.js` `src/main.js` | 关窗只隐藏，内核与任务继续跑；退出走托盘或菜单 |
+| 系统托盘 | `src/tray.js` | 显示/隐藏/重启内核/**切换 Home**/`dsh` 命令安装与卸载/检查更新/安全模式/开机自启/退出，带实时状态行与更新进度 |
+| 关闭即隐藏 | `src/tray.js` `src/main.js` | 关窗只隐藏，内核与任务继续跑；退出走托盘或菜单。**首次隐藏前说明一次**（「关闭窗口不会退出」），确认后不再打扰；取消则下次仍问 |
+| 拖放文件取本机路径 | `src/preload.cjs` | 拖进来的文件以 `@/path` 引用而非上传字节——4 GB 产物能附加与什么都附加不了的差别；粘贴来的字节无路径则照常上传 |
+| 主题跟随应用 | `src/theme-bridge.js` | 应用内切深色时，窗口边框、原生菜单、托盘提示一起切，不出现深色应用装在浅色边框里 |
 | 退出确认 | `src/exit-guard.js` | 退出前弹确认框，策略见 `kernel.exitPolicy` |
 | 窗口几何记忆 | `src/window-state.js` | 记住尺寸位置；显示器拔掉后不会把窗口丢到屏幕外 |
 | 托盘图标 | `assets/trayTemplate.png` | Linux 任务栏图标 |
@@ -474,6 +479,10 @@ dsh: skipping profile bundle "xxx"    ← 哪个插件没加载，看得见
 | 键 | 说明 |
 |---|---|
 | `renderer.maxRecoveries` / `recoveryWindowMs` | 渲染进程崩溃后自动 reload 的次数与窗口（默认 3 次 / 60 秒） |
+| `DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS` | 环境变量。后台检查更新的间隔（默认 `600000`，即 10 分钟） |
+| `DSH_DESKTOP_UPDATE_CHECK_MAX_BACKOFF_MS` | 环境变量。连续失败时的退避上限（默认 `3600000`，即 1 小时） |
+| `DSH_DESKTOP_UPDATE_CHECK_JITTER` | 环境变量。实际等待在间隔上浮动的比例（默认 `0.2`） |
+| `DSH_DESKTOP_LOGIN_SHELL_TIMEOUT_MS` | 环境变量。读取登录 shell 环境的上限（默认 `10000` 毫秒） |
 | `splashMinMs` | 启动页最短展示时长（默认 3000ms）。内核就绪后至少再停这么久，让你看清启动日志；`0` 表示就绪即切走 |
 | `tray.summonAccelerator` | 全局快捷键，一键召唤/隐藏窗口（默认 `CommandOrControl+Shift+Space`） |
 | `tray.showBalance` / `rechargeUrl` | 是否显示充值入口及其地址 |
@@ -592,6 +601,14 @@ offline 包内嵌官方压缩包与对应的 `SHASUMS256.txt`：`bootstrap.sh` �
 | `src/exit-guard.js` | 退出前是否要问 |
 | `src/safe-mode.js` | 安全模式该停用哪些 bundle |
 | `src/diagnostics.js` | 崩溃报告写哪、留几份 |
+| `src/fatal-recovery.js` | 崩溃后给用户哪几条路 |
+| `src/login-shell-environment.js` | GUI 启动怎么补回登录 shell 的环境 |
+| `src/cli-command.js` | `dsh` 命令怎么装、怎么保证不误删用户的 |
+| `src/background-notice.js` | 「关窗口会不会退出」只问一次，怎么记得住 |
+| `src/theme-bridge.js` | 应用的主题怎么同步到原生界面 |
+| `src/update-schedule.js` | 更新检查什么时候问、失败了怎么退避 |
+| `src/update-failure.js` | 每种失败该说哪句话 |
+| `src/update-state.js` | 更新进度报给谁、报成什么样 |
 | `src/config-file.js` | 配置如何写才不撕裂 |
 | `src/desktop-commands.js` | 网页能请求哪些桌面动作 |
 | `src/runtime-doctor.js` | Electron/Node/dsh 在不在、版本够不够 |
