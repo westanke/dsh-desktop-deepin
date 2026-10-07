@@ -15,6 +15,48 @@
 
 import { app, dialog } from 'electron'
 import { getConfig, isInstalledLaunch } from './config.js'
+import { classifyUpdateFailure, updateFailureDetail, updateFailureSummary } from './update-failure.js'
+import { downloadState, updateState, updateStateChanged } from './update-state.js'
+
+/**
+ * Where the current update state is published.
+ *
+ * A single holder rather than a callback parameter so the tray and the page can
+ * be updated from the updater's event handlers, which are wired in one place
+ * and have no caller to pass anything through.
+ *
+ * @type {(state: import('./update-state.js').UpdateState) => void}
+ */
+let publish = () => {}
+
+/**
+ * The state last published, so an unchanged tick is not re-sent.
+ *
+ * @type {import('./update-state.js').UpdateState | undefined}
+ */
+let lastPublished = undefined
+
+/**
+ * Points the updater's state at whatever renders it.
+ *
+ * @param {(state: import('./update-state.js').UpdateState) => void} sink - receives every change
+ * @returns {void}
+ */
+export function setUpdateStateSink(sink) {
+  publish = typeof sink === 'function' ? sink : () => {}
+}
+
+/**
+ * Publishes a state, skipping one that says nothing new.
+ *
+ * @param {import('./update-state.js').UpdateState} state - what changed
+ * @returns {void}
+ */
+function emit(state) {
+  if (!updateStateChanged(lastPublished, state)) return
+  lastPublished = state
+  publish(state)
+}
 
 /**
  * Checks for a newer release and notifies the user.
@@ -78,17 +120,60 @@ export async function checkForUpdatesAndNotify() {
     repo: updates.repo,
   })
 
+  // The updater reports progress through events, not through the promise the
+  // check returns, so the state has to come from here for the tray and the page
+  // to show anything at all.
+  autoUpdater.on('checking-for-update', () => {
+    emit(updateState({ phase: 'checking' }))
+  })
+  // `ProgressInfo` carries bytes rather than a version, so the download events
+  // can only name what `update-available` announced.
+  /** @type {string | undefined} */
+  let targetVersion
+  autoUpdater.on('update-available', (info) => {
+    targetVersion = typeof info?.version === 'string' ? info.version : undefined
+    emit(updateState({ phase: 'available', version: targetVersion }))
+  })
+  autoUpdater.on('update-not-available', () => {
+    targetVersion = undefined
+    emit(updateState({ phase: 'idle' }))
+  })
+  autoUpdater.on('download-progress', (progress) => {
+    emit(downloadState(progress?.percent ?? 0, targetVersion ?? ''))
+  })
+  autoUpdater.on('update-downloaded', (info) => {
+    emit(updateState({
+      phase: 'ready',
+      version: typeof info?.version === 'string' ? info.version : targetVersion,
+    }))
+  })
+
   try {
+    emit(updateState({ phase: 'checking' }))
     const result = await autoUpdater.checkForUpdatesAndNotify()
     if (result?.updateInfo === undefined) {
+      emit(updateState({ phase: 'idle' }))
       await dialog.showMessageBox({
         type: 'info',
-        title: 'Up to date',
-        message: `You are running v${app.getVersion()}.`,
+        title: '已是最新版本',
+        message: `当前运行 v${app.getVersion()}。`,
       })
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    await dialog.showErrorBox('Update check failed', message)
+    const failure = { operation: /** @type {const} */ ('check'), message }
+    emit(updateState({ phase: 'error', failure: classifyUpdateFailure(failure) }))
+    // The summary says what happened in terms the user can act on; the raw
+    // diagnostic goes behind a second line, because it carries URLs and
+    // whatever else the updater put there.
+    const detail = updateFailureDetail(message)
+    await dialog.showMessageBox({
+      type: 'warning',
+      title: '检查更新失败',
+      message: updateFailureSummary(failure),
+      detail: detail === '' ? '' : `技术细节：\n${detail}`,
+      buttons: ['好'],
+      noLink: true,
+    })
   }
 }
