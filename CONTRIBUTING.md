@@ -98,3 +98,37 @@ Startup failures are the most common category, and the shell captures the kernel
 for exactly this reason. Include what the error dialog said, your OS, and your Node
 version (`node --version`). Please check the output for anything sensitive before pasting
 it — redaction is pattern-based and cannot be complete.
+
+## Debugging: verify the assumption, not the code
+
+A shell bug report usually arrives as "this file/component isn't loading" or "the renderer
+is black". The instinct is to check your own code first — the path, the syntax, the
+environment. That instinct is often wrong, and acting on it burns hours.
+
+**Reproduce with the smallest thing that shows the symptom.** If a preload script fails,
+write a two-line preload and load it in the same runtime. If that fails too, the problem was
+never your code. This step found the real cause of a long black-screen hunt in this
+repository: a two-line preload failed identically, which ruled out the path, the
+permissions, the sandbox helper and the extension, and pointed at the API call itself
+(`require('electron')` versus a bare global reference).
+
+**Test one variable at a time, and let the result decide.** Flipping `sandbox: false`
+and watching the symptom persist is evidence; flipping it and watching nothing change is
+also evidence. Write down what each observation rules *out*, not just what it suggests.
+
+**Prefer a real runtime over a hand-written stand-in.** A fake server you wrote will
+happily agree with your assumptions — it will not redirect, it will not set a cookie, it
+will not build its URL from `document.baseURI`. When a stub and the product disagree,
+the product is right by definition. Every bug in this repository that took more than one
+attempt came from the stub, never from the product.
+
+**When the official shell does the same thing, read all of it.** The desktop shell
+spreads one capability across several files: data prepared in `main.ts`, handed over
+through `desktop-host`, set on the page by the renderer's entry, and read by the kernel.
+Copying only the last step produces code that looks right and connects to nothing.
+Follow the data from where it is produced to where it is consumed.
+
+**Make the failure observable before guessing.** When a runtime error is ambiguous, add a
+probe that turns "is it working?" into a value you can read (`preload.cjs` exposes
+`window.__dshPreloadProbe` and reports over IPC; the main process writes the verdict to
+`userData/logs/`). One probe run is worth a dozen speculative edits.

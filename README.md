@@ -65,6 +65,16 @@ UOS 20 这类老系统与 Deepin 25 / UOS 25 这类新系统跑的是**同一个
 代价是首次启动要下载约 180 MB 运行时——而这一点被「deb 只装约 160 KB 壳代码 + 装完后台
 预下载」抵掉了。
 
+### 界面与官方壳同源：`dsh-app://` 与原生右键菜单
+
+内核页面加载在 `dsh-app://app/` 下，与官方桌面壳同一形态：页面的相对路径请求由协议层
+拦截、转发到内核 origin 并带上当次启动的令牌，WebSocket 走独立通道。对外表现是
+DevTools 里看到的请求域名是壳域，而不是每换一个内核端口就变一次的 `127.0.0.1:<端口>`。
+
+附带 Electron 默认不给的原生右键菜单：按当前编辑状态动态给项——可编辑处给
+撤销/重做/剪切/复制/粘贴/全选（各项按实际可用性置灰），选中文字时只给复制，
+无选中不弹，文案为中文。没有它，输入框无法右键粘贴、回答无法右键复制。
+
 > 一句话：选 Electron 不是因为它小（它不小），而是因为它**把不确定性从用户的系统搬进了
 > 自己的包**。对一个以国产老系统为首要目标的壳，这个交换是划算的。
 >
@@ -587,9 +597,12 @@ offline 包内嵌官方压缩包与对应的 `SHASUMS256.txt`：`bootstrap.sh` �
 | `src/runtime-doctor.js` | Electron/Node/dsh 在不在、版本够不够 |
 | `src/runtime-install.js` | 缺的东西从哪下、怎么校验 |
 
-其余模块（`main.js`、`tray.js`、`kernel-*.js`、`preload.js`、`dom-observer.js`、
+其余模块（`main.js`、`tray.js`、`kernel-*.js`、`preload.cjs`、`dom-observer.js`、
 `loading-page.js`、`update.js`、`log-redact.js`、`node-runtime.js`、`shell-patch.js`）
-负责 Electron 与进程 IO。
+负责 Electron 与进程 IO。其中 `preload.cjs` 的 `.cjs` 后缀是承重件：本目录受
+package.json 的 `"type": "module"` 管辖，同名 `.js` 会被当成 ES Module 加载而
+拿不到 `require`；它本身也必须用 `require('electron')` 取 `contextBridge`，
+裸全局在该运行时不存在。
 
 **纯 shell 例外**：`tools/bootstrap.sh` 刻意不用 Node 写。它负责「检查 Node 在不在并把它装上」，
 如果它自己依赖 Node，Node 缺失时就启动不了——自举死循环。所以只用
