@@ -12,7 +12,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { mkdir, symlink, cp } from 'node:fs/promises'
 import { dirname, basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { app, BrowserWindow, dialog, ipcMain, Menu, protocol, screen, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, protocol, screen, shell } from 'electron'
 import { findFreePort } from './kernel-process.js'
 import { KernelSupervisor } from './kernel-supervisor.js'
 // Deprecated: kept for the rollback path. The scheme URL in `loadingUrl` /
@@ -22,6 +22,8 @@ import { KernelSupervisor } from './kernel-supervisor.js'
 import { errorPageHtml, loadingPageHtml } from './loading-page.js'
 import { getConfig, isInstalledLaunch } from './config.js'
 import { buildKernelArgs, buildKernelEnv, isSupportedNodeVersion } from './kernel-runtime.js'
+import { readLoginShellEnvironment, resolveLoginShellConfig } from './login-shell-environment.js'
+import { describeCommand, installCommand, uninstallCommand } from './cli-command.js'
 import { familyMarkerEnv, markerValueFor, reapOrphans } from './orphan-reaper.js'
 import { nodeBinaryName } from './node-runtime.js'
 import { httpProbe, waitForReady } from './readiness.js'
@@ -31,6 +33,11 @@ import { buildShellPatch, serialisePatch } from './shell-patch.js'
 import { writeConfigFile } from './config-file.js'
 import { denyUnexpectedPermissions } from './permissions.js'
 import { writeCrashReport } from './diagnostics.js'
+import { reportFatal } from './fatal-recovery.js'
+import { BackgroundNotice } from './background-notice.js'
+import { resolveThemeSource, themeBridgeScript } from './theme-bridge.js'
+import { IDLE_UPDATE_STATE, isUpdateBusy, updateStatusLine } from './update-state.js'
+import { createUpdateSchedule, resolveUpdateScheduleConfig } from './update-schedule.js'
 import { captureWindowState, fitWindowState } from './window-state.js'
 import { resolveBindings, shortcutDeliveryMode, validateBindings } from './shortcuts.js'
 import { exitConfirmCopy, shouldConfirmExit } from './exit-guard.js'
@@ -161,6 +168,16 @@ let mainWindow = null
 const shellProtoState = { kernelOrigin: null }
 /** @type {ShellTray | null} */
 let tray = null
+/**
+ * The one-time "closing the window does not quit" notice.
+ *
+ * Built on first use rather than at module load: it needs `app.getPath`, which
+ * is only meaningful once the app is ready, and a window cannot be closed
+ * before that either.
+ *
+ * @type {BackgroundNotice | null}
+ */
+let trayNotice = null
 /** @type {{phase: string, stage?: string, attempts?: number, retryDelayMs?: number} | null} */
 let kernelState = null
 /**
@@ -795,6 +812,51 @@ async function toggleSafeMode() {
 }
 
 /**
+ * What is published at the `dsh` command path, for the tray item.
+ *
+ * @returns {Promise<'ours' | 'foreign' | 'stale' | 'absent'>}
+ */
+async function readCommandState() {
+  try {
+    return (await describeCommand()).state
+  } catch (error) {
+    console.warn(`could not read the dsh command: ${error instanceof Error ? error.message : String(error)}`)
+    return 'absent'
+  }
+}
+
+/**
+ * Publishes or removes the `dsh` command, then reports what happened.
+ *
+ * The target is this shell's own launcher, not the kernel binary it currently
+ * supervises: the command should survive a kernel restart and a home switch,
+ * and it should keep working after this release is upgraded.
+ *
+ * @returns {Promise<void>}
+ */
+async function toggleCommand() {
+  const state = await readCommandState()
+  const result = state === 'ours'
+    ? await uninstallCommand()
+    : await installCommand({ target: process.execPath, args: [here, '--profile', 'web'] })
+  tray?.setCommandState(await readCommandState())
+  const detail = result.ok
+    ? state === 'ours'
+      ? '已从 PATH 移除'
+      : '已安装，新开的终端里可用'
+    : result.message
+  if (result.ok === false) console.warn(`dsh command: ${result.message}`)
+  if (mainWindow !== null && !mainWindow.isDestroyed()) {
+    void dialog.showMessageBox(mainWindow, {
+      type: result.ok ? 'info' : 'warning',
+      message: 'dsh 命令',
+      detail,
+      buttons: ['好'],
+    })
+  }
+}
+
+/**
  * Sends the current stage to the loading page, retrying until the page's script
  * is actually running.
  *
@@ -905,6 +967,35 @@ async function preferredPort(host) {
   // fixed port can be held by another dsh instance, and probing a stranger's
   // kernel is what produced the startup timeout.
   return findFreePort(host)
+}
+
+/**
+ * Reads the environment the kernel should launch under.
+ *
+ * A GUI launch on Linux and macOS inherits only what the session manager
+ * hands it, so everything the user's shell startup files export — `PATH`
+ * additions, proxy variables, package mirrors, locale — is missing. The kernel
+ * would then run in a different environment than the user's own terminal, and
+ * the symptom is tools that work in one place and not the other.
+ *
+ * Failure is never fatal. The probe runs arbitrary rc files; when none of the
+ * candidate shells produces an environment the inherited one is used and the
+ * reason is logged, because a shell that cannot be read must not stop the app
+ * from starting.
+ *
+ * @returns {Promise<NodeJS.ProcessEnv>} the environment for the kernel
+ */
+async function readLaunchEnvironment() {
+  if (process.platform === 'win32') return { ...process.env }
+  const timeoutMs = resolveLoginShellConfig(process.env)
+  const { environment, failures } = await readLoginShellEnvironment(process.env, timeoutMs)
+  if (failures.length > 0) {
+    const detail = failures.map((failure) => `${failure.shell} (${failure.reason})`).join(', ')
+    // Every candidate failing is worth a line; some shells are simply absent,
+    // so only the first shell's absence is unremarkable.
+    console.warn(`login-shell environment unavailable, using the inherited environment: ${detail}`)
+  }
+  return { ...environment }
 }
 
 /**
@@ -1023,6 +1114,15 @@ async function startKernel() {
   // state callback below is what the loading page and the tray read. Each
   // attempt takes a fresh port, because the port the last one died on may
   // still be in TIME_WAIT.
+  //
+  // The environment the kernel launches under is read once, before the first
+  // attempt: a GUI launch on Linux and macOS inherits only the session
+  // manager's variables, so `PATH` additions, proxy settings and mirrors from
+  // the user's shell startup files are missing — the kernel would then run in a
+  // different environment than the user's terminal. Retries reuse the same
+  // read: the answer cannot change mid-launch, and an rc file that hangs would
+  // otherwise be able to stall every attempt.
+  const launchEnv = await readLaunchEnvironment()
   const supervisor = new KernelSupervisor({
     onState: (state) => {
       // Keep the latest state where both the tray and a late-coming window can
@@ -1046,7 +1146,7 @@ async function startKernel() {
       // is implemented as "change the variable, restart the kernel", and every
       // attempt — including the retries the supervisor makes on its own — has
       // to use whichever home is current at that moment.
-      const kernelEnv = buildKernelEnv({ parentEnv: process.env, dshHome, runElectronAsNode })
+      const kernelEnv = buildKernelEnv({ parentEnv: launchEnv, dshHome, runElectronAsNode })
       return {
         nodePath,
         args: buildKernelArgs({ binPath, port, patchFiles }),
@@ -1083,13 +1183,55 @@ async function startKernel() {
     // The kernel is gone for good; nothing supervises its servants any more.
     currentKernelPid = null
     void sweepOrphans('gave-up')
-    void writeCrashReport({
-      userData: app.getPath('userData'),
+
+    // The in-window error page explains but offers nothing, and by this point
+    // the window is showing that page because the app has nothing better to
+    // render. A native dialog carries the same report plus a way forward — and
+    // a port collision, the failure a user can actually do something about, is
+    // called out separately so they do not go hunting for a broken plugin.
+    void reportFatal({
+      error: new Error('内核反复退出，已停止自动重启', {
+        cause: new Error(tail(process_.logText(), 25)),
+      }),
       source: 'host',
-      appVersion: app.getVersion(),
-      message: 'kernel gave up after repeated exits',
-      output: process_.logText(),
-    }).catch(() => undefined)
+      writeReport: () =>
+        writeCrashReport({
+          userData: app.getPath('userData'),
+          source: 'host',
+          appVersion: app.getVersion(),
+          message: 'kernel gave up after repeated exits',
+          output: process_.logText(),
+        }),
+      show: async ({ detail, buttons }) => {
+        const { response } = await dialog.showMessageBox({
+          type: 'error',
+          title: 'DeepSeek Harness 启动失败',
+          message: 'DeepSeek Harness 启动失败',
+          detail,
+          buttons,
+          defaultId: 1,
+          cancelId: 0,
+          noLink: true,
+        })
+        return response
+      },
+      stop: async () => {
+        await supervisor.stop().catch(() => undefined)
+      },
+      disablePlugins: async () => {
+        // The next launch starts without third-party bundles. Setting the flag
+        // is what `restartKernel` reads, so the relaunch below picks it up.
+        safeMode = true
+        tray?.setSafeMode(true)
+      },
+      exit: () => {
+        app.exit(1)
+      },
+      restart: () => {
+        app.relaunch()
+        app.exit(0)
+      },
+    })
 
     if (mainWindow !== null && !mainWindow.isDestroyed()) {
       void loadErrorPage(mainWindow, '内核启动失败，未能就绪。', tail(process_.logText(), 25))
@@ -1235,9 +1377,10 @@ function installApplicationMenu(window) {
           closeWindow: () => {
             if (window.isDestroyed()) return
             // Match the window's own close handler: hide rather than quit, so
-            // the kernel and its tasks keep running.
+            // the kernel and its tasks keep running — including asking first,
+            // since from a menu the outcome is just as invisible.
             if (tray === null || tray.isQuitting) window.close()
-            else window.hide()
+            else backgroundNotice().close(() => window.hide())
           },
           reload: () => {
             if (!window.isDestroyed()) window.webContents.reload()
@@ -1613,6 +1756,11 @@ function createWindow() {
     void webContents.executeJavaScript(OBSERVER_SOURCE, true).catch((error) => {
       console.error(`observer inject failed: ${error instanceof Error ? error.message : String(error)}`)
     })
+    // The page decides its own theme; Electron's chrome has to follow it or the
+    // window frame and native menus disagree with the window's contents.
+    void webContents.executeJavaScript(themeBridgeScript(), true).catch((error) => {
+      console.error(`theme bridge inject failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
     // Preload self-check. DevTools reports a preload problem as
     // "Unable to load preload script" without saying whether the file was
     // missing, unreadable or threw while running, so read the mark the preload
@@ -1647,7 +1795,10 @@ function createWindow() {
     if (tray === null || tray.isQuitting) return
     if (!window.isVisible()) return
     event.preventDefault()
-    window.hide()
+    // Ask first, once. Closing the window looks like quitting but is not, and
+    // on Linux there is no dock to reveal afterwards — so a user with a task
+    // running would lose sight of it with no indication anything is left.
+    backgroundNotice().close(() => window.hide())
   })
 
   window.once('ready-to-show', () => window.show())
@@ -1673,6 +1824,34 @@ function showWindow() {
   mainWindow.show()
   mainWindow.focus()
   mainWindow.webContents.send('shell:shown')
+}
+
+/**
+ * The one-time tray notice, created on first use.
+ *
+ * @returns {BackgroundNotice}
+ */
+function backgroundNotice() {
+  if (trayNotice !== null) return trayNotice
+  trayNotice = new BackgroundNotice({
+    markerPath: join(app.getPath('userData'), 'tray-notice.acknowledged'),
+    show: async ({ message }) => {
+      const { response } = await dialog.showMessageBox({
+        type: 'info',
+        title: 'DeepSeek Harness',
+        message,
+        buttons: ['知道了'],
+        defaultId: 0,
+        // There is nothing to cancel out of: the dialog exists to explain, and
+        // the answer is the same either way, so it is not closable by dismissal.
+        cancelId: -1,
+        noLink: true,
+      })
+      return response
+    },
+    focus: () => showWindow(),
+  })
+  return trayNotice
 }
 
 /**
@@ -1800,13 +1979,68 @@ async function checkForUpdates() {
   // Packaged builds call into the auto-updater wired in update.js. Kept as a
   // no-op here so the tray item always has a handler without duplicating the
   // updater logic in two places.
+  // Everything the updater reports goes through one sink, so the tray line and
+  // the page's own indicator can never disagree about what is happening.
+  const { checkForUpdatesAndNotify, setUpdateStateSink } = await import('./update.js')
+  setUpdateStateSink(publishUpdateState)
   try {
-    const { checkForUpdatesAndNotify } = await import('./update.js')
     await checkForUpdatesAndNotify()
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     dialog.showErrorBox('Update check failed', message)
+  } finally {
+    publishUpdateState(IDLE_UPDATE_STATE)
   }
+}
+
+/**
+ * The background check, or null when it was never started.
+ *
+ * @type {ReturnType<typeof createUpdateSchedule> | null}
+ */
+let updateSchedule = null
+
+/**
+ * Publishes an update state to every surface that shows one.
+ *
+ * The tray line and the page's indicator read the same record, and a state that
+ * says nothing new is not re-sent: a status line that re-renders on every
+ * identical tick is one nobody can read.
+ *
+ * @param {import('./update-state.js').UpdateState} state - what changed
+ * @returns {void}
+ */
+function publishUpdateState(state) {
+  const busy = isUpdateBusy(state)
+  tray?.setUpdateStatus(busy ? updateStatusLine(state) : null)
+  if (mainWindow !== null && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('shell:update', state)
+  }
+}
+
+/**
+ * Starts the background check.
+ *
+ * Only for an installed build: a source checkout has no update to fetch, and a
+ * timer that can only ever fail is a timer that only ever backs off.
+ *
+ * @returns {void}
+ */
+function startUpdateSchedule() {
+  if (!isInstalledLaunch()) return
+  if (getConfig().updates?.enabled !== true) return
+  if (updateSchedule !== null) return
+  updateSchedule = createUpdateSchedule({
+    config: resolveUpdateScheduleConfig(process.env),
+    check: async () => {
+      const { checkForUpdatesAndNotify } = await import('./update.js')
+      await checkForUpdatesAndNotify()
+    },
+    onSchedule: ({ failures }) => {
+      if (failures > 0) console.warn(`update check failed ${String(failures)} time(s); backing off`)
+    },
+  })
+  updateSchedule.start()
 }
 
 /**
@@ -1880,6 +2114,11 @@ if (!app.requestSingleInstanceLock()) {
       if (ticket === null) console.warn('kernel ticket unavailable; WebSocket dials will not authenticate')
       else shellProtoState.tickets = new Map(ticket)
 
+      // The background update check, once the application is usable. Started
+      // here rather than at import so a failure to reach the feed cannot delay
+      // anything the user is waiting for.
+      startUpdateSchedule()
+
       // The IPC channel from the locked-down preload. The renderer can only
       // call `shell.notify`; everything else in the kernel web UI has no
       // bridge into the shell.
@@ -1888,6 +2127,15 @@ if (!app.requestSingleInstanceLock()) {
         const title = typeof payload?.title === 'string' ? payload.title : 'DeepSeek Harness'
         const body = typeof payload?.body === 'string' ? payload.body : ''
         tray.notify(title, body)
+      })
+
+      // The page's theme choice, so Electron's own chrome matches the window
+      // frame, native menus and tray rather than following the OS while the
+      // application follows the user.
+      ipcMain.on('shell:theme', (_event, payload) => {
+        // An unrecognised value resolves to `system` rather than to a guess:
+        // fighting the user's desktop setting is worse than following it.
+        nativeTheme.themeSource = resolveThemeSource(payload?.source)
       })
 
       // The preload reporting that it ran. DevTools says only "Unable to load
@@ -1950,6 +2198,8 @@ if (!app.requestSingleInstanceLock()) {
         onCheckUpdates: () => void checkForUpdates(),
         onToggleLaunchAtLogin: () => toggleLaunchAtLogin(),
         onToggleSafeMode: () => void toggleSafeMode(),
+        commandState: await readCommandState(),
+        onToggleCommand: () => void toggleCommand(),
         safeMode,
         launchAtLogin: app.getLoginItemSettings().openAtLogin,
         homes: describeHomes(homeRegistry),
@@ -2154,6 +2404,11 @@ async function requestQuit() {
   // "取消" or a dismissed dialog (Esc) leaves everything as it was.
   if (response.response !== 0) return
 
+  // The background check holds a timer and possibly a request in flight; a
+  // timer that outlives the application is what keeps a Node process alive
+  // after the last window is gone.
+  updateSchedule?.stop()
+  updateSchedule = null
   tray?.prepareQuit()
   app.quit()
 }

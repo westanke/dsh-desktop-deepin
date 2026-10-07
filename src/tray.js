@@ -61,6 +61,24 @@ export function trayTemplateIconPath(here) {
  */
 
 const SUMMON_ACCELERATOR = 'CommandOrControl+Shift+Space'
+
+/**
+ * The `dsh` command item, by what is currently published at the path.
+ *
+ * Only `ours` is clickable: `foreign` means somebody else's command sits
+ * there, `stale` means ours was changed after installation and only the user
+ * can decide about it, and `absent` is the state that offers to install — a
+ * separate item, so installing never hides behind a toggle that reads as
+ * already-on.
+ *
+ * @type {Readonly<Record<'ours' | 'foreign' | 'stale' | 'absent', string>>}
+ */
+const CLI_COMMAND_LABELS = Object.freeze({
+  ours: 'dsh 命令：已安装（点击卸载）',
+  foreign: 'dsh 命令：被其它程序占用',
+  stale: 'dsh 命令：已被改动，请手动检查',
+  absent: 'dsh 命令：未安装',
+})
 // The recharge URL and summon shortcut can be overridden through config.json.
 // config.js is pure fs/path, so this import is safe under plain Node too.
 let RECHARGE_URL = 'https://platform.deepseek.com/top_up'
@@ -99,10 +117,25 @@ export class ShellTray {
   #safeMode = false
   /** @type {() => void} */
   #onToggleSafeMode = () => {}
+  /**
+   * What is published at `~/.local/bin/dsh`: ours, someone else's, stale
+   * (installed by us and changed since), or absent.
+   *
+   * @type {'ours' | 'foreign' | 'stale' | 'absent'}
+   */
+  #commandState = 'absent'
+  /** @type {() => void} */
+  #onToggleCommand = () => {}
   /** @type {string | null} */
   #balance = null
   /** @type {boolean} */
   #shortcutRegistered = false
+  /**
+   * The update state as one line, or null when the shell has nothing to say.
+   *
+   * @type {string | null}
+   */
+  #updateStatus = null
 
   /**
    * The kernel homes offered in the menu, and the one currently in use.
@@ -136,6 +169,9 @@ export class ShellTray {
    * @param {() => void} [options.onToggleSafeMode] - toggle Safe Mode
    * @param {boolean} [options.safeMode] - whether Safe Mode is on
    * @param {boolean} [options.launchAtLogin] - whether autostart is on
+   * @param {'ours' | 'foreign' | 'stale' | 'absent'} [options.commandState]
+   *   - what is published at the `dsh` command path
+   * @param {() => void} [options.onToggleCommand] - publish or remove the command
    * @param {string | null} [options.balance] - balance string to show, or null
    * @param {Array<{id: string, name: string, path: string, active: boolean, builtin: boolean, duplicateOf: string | null}>} [options.homes]
    *   - the kernel homes to offer
@@ -143,7 +179,7 @@ export class ShellTray {
    * @param {() => void} [options.onAddHome] - register another home directory
    * @returns {void}
    */
-  attach({ iconPath, window, onShow, onQuit, onState, onRestart, onCheckUpdates, onToggleLaunchAtLogin, onToggleSafeMode, launchAtLogin = false, safeMode = false, balance = null, homes = [], onSelectHome, onAddHome }) {
+  attach({ iconPath, window, onShow, onQuit, onState, onRestart, onCheckUpdates, onToggleLaunchAtLogin, onToggleSafeMode, launchAtLogin = false, safeMode = false, commandState = 'absent', onToggleCommand, balance = null, homes = [], onSelectHome, onAddHome }) {
     if (this.#tray !== null) return
     if (!existsSync(iconPath)) {
       throw new Error(`tray icon missing: ${iconPath}`)
@@ -157,6 +193,8 @@ export class ShellTray {
     this.#launchAtLogin = launchAtLogin
     this.#safeMode = safeMode
     if (typeof onToggleSafeMode === 'function') this.#onToggleSafeMode = onToggleSafeMode
+    this.#commandState = commandState
+    if (typeof onToggleCommand === 'function') this.#onToggleCommand = onToggleCommand
     this.#balance = balance
     this.#setHomes(homes)
     if (typeof onSelectHome === 'function') this.#onSelectHome = onSelectHome
@@ -264,6 +302,19 @@ export class ShellTray {
   }
 
   /**
+   * Reflects the update state, so the menu says what is happening without the
+   * user opening the application to find out.
+   *
+   * @param {string | null} status - one line from `updateStatusLine`, or null
+   *   when nothing is happening and the check action belongs there instead
+   * @returns {void}
+   */
+  setUpdateStatus(status) {
+    this.#updateStatus = status
+    this.#refreshMenu()
+  }
+
+  /**
    * Updates the launch-at-login flag and refreshes the checkbox.
    *
    * @param {boolean} enabled
@@ -283,6 +334,18 @@ export class ShellTray {
    */
   setSafeMode(enabled) {
     this.#safeMode = enabled
+    this.#refreshMenu()
+  }
+
+  /**
+   * Reflects what is published at the `dsh` command path, so the menu never
+   * offers to remove a command this shell did not install.
+   *
+   * @param {'ours' | 'foreign' | 'stale' | 'absent'} state
+   * @returns {void}
+   */
+  setCommandState(state) {
+    this.#commandState = state
     this.#refreshMenu()
   }
 
@@ -472,6 +535,16 @@ export class ShellTray {
         click: () => this.#onToggleSafeMode(),
       },
       { type: 'separator' },
+      {
+        // The shell is only half useful if a terminal opened beside it cannot
+        // reach it, and `dsh` has to be on `PATH` for that. The official shell
+        // publishes the command on macOS and Windows and declines to build it
+        // for Linux (`command-manager-entry.ts` throws off darwin/win32), so
+        // this is a Linux-only addition.
+        label: CLI_COMMAND_LABELS[this.#commandState],
+        enabled: this.#commandState === 'ours' || this.#commandState === 'absent',
+        click: () => this.#onToggleCommand(),
+      },
       { label: this.#safeMode ? `${this.#statusLabel()}（安全模式）` : this.#statusLabel(), enabled: false },
       {
         label: this.#kernelState?.phase === 'crashed' ? '启动内核' : '重启内核',
@@ -497,7 +570,12 @@ export class ShellTray {
 
     items.push(
       { type: 'separator' },
-      { label: '检查更新…', click: () => this.#onCheckUpdates() },
+      // The update line and the action share a slot: while something is
+      // happening the state is what the user needs, and the action waits for
+      // the next check rather than offering a second one mid-download.
+      this.#updateStatus === null
+        ? { label: '检查更新…', click: () => this.#onCheckUpdates() }
+        : { label: this.#updateStatus, enabled: false },
       { type: 'separator' },
       { label: '退出', click: () => this.#quit() },
     )
