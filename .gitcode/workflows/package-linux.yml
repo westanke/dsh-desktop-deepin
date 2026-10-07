@@ -109,9 +109,14 @@ jobs:
 
   package-arm64:
     name: Build deb arm64
-    # 壳代码（src/ tools/ config.json）与架构无关，但可执行位与 offline 包依赖
-    # 目标架构，故与 GitHub 版一致在原生 arm64 runner 上出包。
-    runs-on: [ubuntu-latest, arm64, medium]
+    # 与 amd64 共用 x64 runner，交叉打出 arm64 包：壳代码（src/ tools/ config.json）
+    # 是架构无关的纯 JS + shell，在线 deb 不含任何运行时，Architecture 字段由
+    # build-deb.sh 按参数写入。因此交叉构建与原生构建产物等价。
+    #
+    # 平台实测 arm64 托管 runner 在「初始化步骤」加载插件阶段即失败
+    # （Failed to download and load the plugin），与打包脚本无关；发布可靠性不该
+    # 押在平台侧偶发故障上，故这里不依赖 arm64 runner。
+    runs-on: [ubuntu-latest, x64, small]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
