@@ -18,7 +18,7 @@
  * @module diagnostics
  */
 
-import { mkdir, readdir, rm } from 'node:fs/promises'
+import { mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { atomicWriteFile } from './config-file.js'
 
@@ -170,10 +170,17 @@ export async function writeCrashReport({
 }) {
   try {
     const directory = crashLogDirectory({ userData })
-    await mkdir(directory, { recursive: true })
+    // The reports name the user's home directory and carry whatever the kernel
+    // last printed, so the directory and the files are owner-only. `wx` refuses
+    // to overwrite: two failures in the same millisecond must not silently
+    // clobber the first one's evidence.
+    await mkdir(directory, { recursive: true, mode: 0o700 })
 
     const path = join(directory, crashReportName(source))
-    await atomicWriteFile(path, renderCrashReport({ source, appVersion, kernelVersion, ready, message, output }))
+    await writeFile(path, renderCrashReport({ source, appVersion, kernelVersion, ready, message, output }), {
+      mode: 0o600,
+      flag: 'wx',
+    })
 
     const existing = (await readdir(directory)).filter((name) => name.startsWith('crash-'))
     for (const name of crashReportsToPrune(existing)) {
