@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### 文档
+
+- **补上「内核版本口径」**：README 的「环境要求」此前只写 `dsh 内核 | 任意可运行版本`，
+  读者无法区分 bundled 与 system 两种模式各自钉在哪个版本。现补一张两行表：
+  bundled 模式锁 `0.2.0-rc.2`（`upstream.lock.json`，sha512 校验，升级须显式改锁），
+  system 模式不限（含 `0.2.1-rc.2`）。
+- **给出对 DSH 0.2.1-rc.2 的适配结论**：壳不依赖任何 `@deepseek-ai/*` npm 包，
+  CLI 面 / profile 约定 / 双通道三层在两版间逐字一致，故声明
+  **最低支持 `0.2.0-rc.2`，推荐 `0.2.1-rc.2`**。同时写明两条注意：0.2.1 收紧
+  `isTrustedApiRequest` 的同源校验；0.2.1 移除 6 个包，旧 profile 的 `bundles`
+  清单若列了它们会 import 失败。证据与逐项清单见 `docs/DSH-0.2.1-ADAPTATION.md`。
+  本轮**只改文档，未动源码、未改内核锁、未打包**；运行时表现待真机回归。
+
+### 工程
+
+- **新增文档口径门禁 `npm run docs:check`**（`tools/docs-check.mjs`）。此前本仓
+  **完全没有文档门禁**，README 的内核版本口径与 `upstream.lock.json` 靠人记。
+  新门禁查六项：四个文件存在且可解析、README 的 bundled 内核版本 ↔
+  `upstream.lock.json` 的 `kernel.version`、CHANGELOG 有 Unreleased 或当前版本条目、
+  README 有「最低支持 DSH」声明且不高于 bundled 锁、无未解析占位符，
+  以及每条解析类检查的**下限断言**（一条都没匹配到要报「格式可能变了」，
+  不静默通过）。
+  已接入 `.github/workflows/ci.yml` 的 check job，与 `scan:leaks` 并列。
+  **刻意没有并进 `prepack:app`**：这个门禁还没经历过真实发布周期，且它对
+  「内核版本口径」小节的格式有硬依赖；先在 CI 上跑几轮稳定后再说不迟。
+  `prepack:app` 的前四道顺序与内容一律未动。
+
 ## [0.2.19] — 2026-10-12
 
 ### 变更

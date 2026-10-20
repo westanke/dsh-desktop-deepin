@@ -30,6 +30,7 @@
     "kernel:install": "node tools/install-kernel.js && node tools/install-node.js && node tools/prune-kernel.js",
     "scan:leaks": "node tools/scan-leaks.js",
     "check:runtime-paths": "bash tools/check-runtime-paths.sh",
+    "docs:check": "node tools/docs-check.mjs",
     "prepack:app": "npm run test && npm run typecheck && npm run scan:leaks && npm run check:runtime-paths",
     "dist": "npm run dist:linux",
     "dist:linux": "npm run prepack:app && bash tools/build-deb.sh",

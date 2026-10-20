@@ -44,6 +44,13 @@ jobs:
       - name: Scan for content that must not be published
         run: npm run scan:leaks
 
+      # 文档口径门禁：README 的 bundled 内核版本必须与 upstream.lock.json 的 kernel.version
+      # 一致，CHANGELOG 必须有 Unreleased 或与 package.json version 匹配的条目。
+      # 放在这里而不是 prepack:app：文档漂移在**合入那一刻**就该红，不必等到本地打包；
+      # 且纯读零依赖，耗时毫秒级，不影响本地 dist:linux 的节奏。
+      - name: Check documentation consistency
+        run: npm run docs:check
+
   e2e:
     name: End-to-end (ubuntu)
     runs-on: ubuntu-latest

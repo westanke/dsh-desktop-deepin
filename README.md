@@ -504,6 +504,23 @@ dsh: skipping profile bundle "xxx"    ← 哪个插件没加载，看得见
 | Node | ≥ 22.15 | 内核用了 `zlib.createZstdDecompress`，更早的版本起不来 |
 | dsh 内核 | 任意可运行版本 | 不锁版本，用你已装的 |
 
+**内核版本口径（2026-10-20 补）**：本壳对内核**不设上限、也不设下限**——`start-shell.sh` 探测到
+能跑的 `dsh` 就用（"能跑就行"），Node 与 Electron 才校版本。已核对的两种模式：
+
+| 模式 | 内核版本 | 状态 |
+|---|---|---|
+| bundled（deb 安装目录自带） | **`0.2.0-rc.2`**（`upstream.lock.json` 唯一真相源，sha512 校验） | 已验证；升级需显式改锁 |
+| system（用本机已装的 `dsh`） | **任意**，含 `0.2.1-rc.2` | 已做静态接口核对，待真机回归 |
+
+对 DSH `0.2.1-rc.2` 的核对结论：壳不依赖任何 `@deepseek-ai/*` npm 包（壳的 `package.json` 无
+`@deepseek-ai` 依赖，内核版本与壳的依赖树完全脱钩），CLI 面（`--profile web` / `--patch` /
+`plugin add`）、profile 约定、双通道（`dsh-app://` scheme + `webRequest` 改写）三层在两版间
+**逐字一致**。因此声明：**最低支持 DSH `0.2.0-rc.2`，推荐 `0.2.1-rc.2`**。两条注意：
+0.2.1 收紧了 `isTrustedApiRequest` 的同源校验，且移除了 6 个包（`dsh-hooks-claude-code` /
+`dsh-hooks-codex` / `dsh-tool-ralph` / `dsh-webhook` / `dsh-webhook-github` /
+`dsh-experimental-schedule-bundle`）——**旧 profile 的 `bundles` 清单若列了它们会 import 失败**。
+完整清单见本仓 `docs/DSH-0.2.1-ADAPTATION.md`。
+
 **开发**：Node.js ≥ 22.15.0。
 
 **系统内核模式**（当前默认）：需要本机已装 `dsh`，`launcher.systemDsh` 指向它。
