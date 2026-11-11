@@ -542,6 +542,20 @@ bash tools/bootstrap.sh install
 Debian/UOS 基础系统里必定存在。这是刻意的：它的职责是「检查 Node 在不在并把它装上」，
 如果它自己需要 Node 才能运行，Node 缺失时它根本启动不了，就成了自举死循环。
 
+#### 装 dsh 内核失败时先看日志
+
+npm 的完整输出会写进 `~/.dsh-desktop/runtime/npm-install-dsh.log`，失败时
+`bootstrap.sh` 会直接回显最后 15 行。最常见的一类失败是**启动 npm 的 Node 不对**：
+`npm` 的首行是 `#!/usr/bin/env node`，靠 PATH 找解释器；机器上 `apt install npm` 装的
+旧 Node（UOS / Debian 10 是 10.24）若排在前面，Node 24 自带的 npm 11 会被它启动并立刻
+失败（npm 11 要求 Node ≥ 20）。bootstrap 已把自举下来的 Node 目录前置进 PATH，若日志里
+仍有 `env: 'node': No such file or directory` 或旧 Node 的语法错误，手工前置后重试即可：
+
+```sh
+export PATH="$(ls -d "$HOME"/.dsh-desktop/runtime/node-*/bin | head -1):$PATH"
+bash tools/bootstrap.sh install
+```
+
 ---
 
 ## 开发

@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### 修复
+
+- **首次启动装 dsh 内核不再静默失败：npm 必须由自举下来的 Node 启动**
+  （Gitee [IKSSLI](https://gitee.com/westanke/dsh-desktop-deepin/issues/IKSSLI)：
+  UOS 专业版 1070 / arm64，Node 24 自举包已在、apt 的 npm 5.8 已装，仍报「npm 安装失败」）。
+  Node 官方包的 `bin/npm` 是首行 `#!/usr/bin/env node` 的 JS 脚本，按 PATH 找解释器；
+  而 `tools/bootstrap.sh` 的 `install_dsh` 只算出 `NODE_BIN` 的绝对路径就 exec npm，
+  PATH 一直没动。UOS / Debian 10 的 `apt install npm` 会把 `/usr/bin/node`（Node 10.24）
+  带上 PATH，于是 Node 24 自带的 npm 11 被 Node 10 启动，立刻失败（npm 11 的 engines
+  要求 Node ≥ 20）；失败输出又被 `>/dev/null 2>&1` 吞掉，用户只看到一句
+  「npm 安装失败」——两条不同的失败文案（「找不到 npm」/「npm 安装失败」）也因此失去
+  区分度。现在 `install_dsh` 先调 `use_node_bin_on_path`（把自举 Node 的 bin 目录
+  **前置**并 export `DSH_NODE_BIN` 给 `install-plugins.sh`），用 `npm --version` 自检，
+  输出落盘到 `~/.dsh-desktop/runtime/npm-install-dsh.log`，失败回显最后 15 行 + 完整
+  路径 + 常见原因，装成功后立刻回填 `DSH_BIN`，让 `writeback` 一次写对 `systemDsh`。
+  沙箱复现（同一份首位是旧 `node` 的 PATH）：修复前 exit 1、修复后装上 `0.2.2-rc.1`。
+
+- **借终端重跑失败不再「闪退」**：双击启动时 `start-shell.sh` 会借终端模拟器重跑
+  自己；bootstrap 失败 → `err` → `exit 1`，终端窗口随即关闭，报错和日志路径全滚没了
+  ——这正是 issue 里「之后每次执行都闪退」的观感。新增 `pause_before_exit`：只在
+  `DSH_BOOTSTRAP_IN_TTY=1` 且真有 tty 时等回车，postinst / 无 tty 的自动化路径不受
+  影响；bootstrap 失败的提示里补上 npm 日志路径。
+
 ### 文档
 
 - **补上「内核版本口径」**：README 的「环境要求」此前只写 `dsh 内核 | 任意可运行版本`，
@@ -20,6 +43,14 @@ All notable changes to this project are documented here. The format follows
   本轮**只改文档，未动源码、未改内核锁、未打包**；运行时表现待真机回归。
 
 ### 工程
+
+- **「npm 调用环境」进了运行时候选门禁**：`tools/check-runtime-paths.sh` 新增 6 条
+  断言——bootstrap 有 `use_node_bin_on_path` 且把 Node 目录前置进 PATH、`install_dsh`
+  在调 npm 前调它、npm 输出落盘、装包那一行不再重定向 `/dev/null`、start-shell.sh 有
+  `pause_before_exit` 且 `err()` 真的调用它、失败提示指向 npm 日志。回归实测：把两个
+  脚本换回 HEAD 版本跑门禁，6 条全变红（本地红/绿都验证过，不是写完就算）。
+  刻意写成「正向断言」而不是查关键字存在：它钉的是**行为约定**（谁启动 npm、失败
+  留什么证据），不是某一行代码的写法。
 
 - **新增文档口径门禁 `npm run docs:check`**（`tools/docs-check.mjs`）。此前本仓
   **完全没有文档门禁**，README 的内核版本口径与 `upstream.lock.json` 靠人记。

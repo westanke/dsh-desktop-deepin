@@ -22,7 +22,17 @@ USER_CONFIG="$USER_CONFIG_DIR/config.json"
 BOOTSTRAP="$SHELL_DIR/tools/bootstrap.sh"
 RUNTIME_DIR="${HOME}/.dsh-desktop/runtime"
 
-err()  { echo "✖ $*" >&2; exit 1; }
+# 失败时若本进程是「借终端重跑自己」那一路（DSH_BOOTSTRAP_IN_TTY=1），
+# 必须把窗口留住：否则 bootstrap 失败 → exit 1 → 终端一闪而过，用户只看到
+# 「闪退」，真正的原因和日志路径全滚没了（Gitee IKSSLI 的闪退就是它）。
+# 只在真有终端时等回车：postinst / 无 tty 的自动化路径不会因此挂住。
+pause_before_exit() {
+  [ "${DSH_BOOTSTRAP_IN_TTY:-}" = "1" ] || return 0
+  [ -t 0 ] || return 0
+  printf '\n按回车键关闭本窗口…' >&2
+  read -r _ 2>/dev/null || true
+}
+err()  { echo "✖ $*" >&2; pause_before_exit; exit 1; }
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  ✅ %s\n' "$*"; }
 bad()  { printf '  ❌ %s\n' "$*"; }
@@ -287,7 +297,8 @@ if [ -n "$MISSING" ]; then
   # 交给纯 shell 的 bootstrap 干活（它不依赖 node，所以 node 缺失时也能跑）。
   # 若上面的后台实例已经装完，bootstrap 会因「全部就绪」直接返回成功。
   bash "$BOOTSTRAP" install || err "运行时下载失败，请检查网络后重试：
-  bash $BOOTSTRAP install"
+  手动重试：bash $BOOTSTRAP install
+  npm 详情：$RUNTIME_DIR/npm-install-dsh.log"
 
   # 下载完成后重新检测 + 校验版本
   ELECTRON=""; NODE_BIN=""; SYSTEM_DSH=""
