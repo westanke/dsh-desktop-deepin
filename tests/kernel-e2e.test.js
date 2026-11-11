@@ -170,6 +170,18 @@ describe(
         output.includes('directory-picker-browse') || output.includes('shell-directory-picker'),
         `the overlay should appear in the composed tree:\n${output.slice(-2000)}`,
       )
+      // A directory picker is two Loader entries: the host backend and the client
+      // surface. Mounting only the backend leaves the `directoryFlow` slots empty,
+      // so the sidebar never renders the "add workspace" button.
+      assert.ok(
+        output.includes('dsh-host-directory-picker-browse'),
+        `the overlay should mount the picker backend:\n${output.slice(-2000)}`,
+      )
+      assert.ok(
+        output.includes('dsh-client-ui-directory-picker-browse'),
+        `the overlay should mount the picker client surface too, otherwise the\n` +
+          `workspace slots stay empty and the add-workspace button never renders:\n${output.slice(-2000)}`,
+      )
     })
 
     it('stops the process tree on shutdown', async () => {

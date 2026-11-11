@@ -22,6 +22,24 @@ describe('buildShellPatch', () => {
     assert.equal(insert.insert[0]?.name, '@deepseek-ai/dsh-host-directory-picker-browse')
   })
 
+  it('pins both faces of the picker, because one entry is not an interaction', () => {
+    const entries = buildShellPatch({ useBrowseDirectoryPicker: true })
+    const insert = entries.find((entry) => entry.insert !== undefined)
+    assert.ok(insert?.insert, 'a replacement row must be inserted')
+
+    // The backend serves `ctx.directoryPicker`; the client surface occupies
+    // ui-workspace's `directoryFlow` slots. With only the backend inserted, the slots had
+    // no occupant, so the sidebar "添加工作区" button and the new-session directory flow
+    // never rendered. Both names must be present, as distinct rows.
+    const names = insert.insert.map((entry) => entry.name)
+    assert.deepEqual(names, [
+      '@deepseek-ai/dsh-host-directory-picker-browse',
+      '@deepseek-ai/dsh-client-ui-directory-picker-browse',
+    ])
+    const ids = insert.insert.map((entry) => entry.id)
+    assert.equal(new Set(ids).size, ids.length, 'each inserted row needs its own id')
+  })
+
   it('guards the disable with the implementation it was written against', () => {
     const [disable] = buildShellPatch({ useBrowseDirectoryPicker: true })
     // If upstream replaces the implementation, this entry should stop matching rather

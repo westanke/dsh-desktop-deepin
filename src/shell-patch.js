@@ -54,11 +54,23 @@ export function buildShellPatch({ useBrowseDirectoryPicker = false } = {}) {
       name: '@deepseek-ai/dsh-host-directory-picker-auto',
       disabled: true,
     })
+    // A directory-picker interaction is a *pair* of Loader entries, not one: the Host
+    // backend that serves `ctx.directoryPicker`, plus the client surface that occupies
+    // ui-workspace's `directoryFlow` slots (sidebar "add workspace" button and the
+    // new-session hero). The adaptive `directory-picker-auto` row mounts both halves
+    // itself; when the shell pins the choice instead, it has to compose the same pair.
+    // Inserting only the backend left the surface unmounted, so the slots stayed
+    // unoccupied, `directoryFlowAvailable` was false, and the "添加工作区" entry never
+    // rendered — the reported "cannot create a workspace".
     entries.push({
       insert: [
         {
           id: 'shell-directory-picker',
           name: '@deepseek-ai/dsh-host-directory-picker-browse',
+        },
+        {
+          id: 'shell-directory-picker-surface',
+          name: '@deepseek-ai/dsh-client-ui-directory-picker-browse',
         },
       ],
     })
