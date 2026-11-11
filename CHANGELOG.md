@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.20] — 2026-11-11
+
 ### 修复
 
 - **首次启动装 dsh 内核不再静默失败：npm 必须由自举下来的 Node 启动**
