@@ -6,6 +6,36 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### 修复
+
+- **「添加工作区」入口消失：钉住目录选择器时必须成对插入后端与客户端 surface**
+  （用户现场：侧栏「工作区」标题右侧只剩搜索和视图选项图标，没有「+ 添加工作区」，
+  终端里也没有报错——入口根本没渲染）。
+  内核的 `directory-picker-auto` 一行在启动时解析一次宿主环境，然后挂载 **两个**
+  Loader entry：Host 后端（提供 `ctx.directoryPicker`）与客户端 surface（占用
+  `dsh-client-ui-workspace` 的 `sidebar.workspaces.directoryFlow` 与
+  `conversation.hero.workspace.directoryFlow` 槽位）。壳在 Linux 上没有
+  zenity/kdialog 时把 auto 行禁掉、换成浏览模式，但只插入了后端那一行，客户端
+  surface 从未挂载：两个槽位没有占位者，`directoryFlowAvailable` 为 false，侧栏
+  「+」和新会话页的目录流都不渲染，于是无法新建工作区。现改为成对插入
+  `@deepseek-ai/dsh-host-directory-picker-browse` 与
+  `@deepseek-ai/dsh-client-ui-directory-picker-browse` 两行（各自独立 id）；
+  `kernel.directoryPicker` 的 `auto`/`browse`/`native` 语义不变。
+  验证（三个内核/patch 组合各起一个实例，首页 HTML 里数客户端包条目）：
+  0.2.1-rc.5 与 0.2.0-rc.2 上，旧 patch 的首页**没有**任何 `dsh-client-ui-directory-picker`
+  条目，新 patch 各出现 1 条，且对应 chunk 里 `sidebar.workspaces.directoryFlow` 与
+  `conversation.hero.workspace.directoryFlow` 各出现 2 次；不挂 patch（内核 auto 自己
+  成对挂载）的对照组首页也有该条目。
+  界面级 A/B（隔离 Xvfb + 独立 userData 的两个壳实例，旧代码用 `git worktree` 取出）：
+  旧实例侧栏按钮只有「选择工作区」，新实例多出「添加工作区」，点击后弹出「选择工作区
+  目录」对话框（可新建文件夹 / 打开）；单元测试改为断言两行都在（旧实现跑新测试失败）。
+
+### 工程
+
+- **补一条「成对插入」回归测试**：`buildShellPatch` 的断言从「插入了后端行」改为
+  「后端行与客户端 surface 行都在、id 各不相同」——正是缺了后一行才让侧栏入口消失，
+  只断言一行的话这个 bug 会原样复发。
+
 ## [0.2.20] — 2026-11-11
 
 ### 修复

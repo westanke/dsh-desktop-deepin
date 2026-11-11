@@ -41,7 +41,7 @@
 |---|---|
 | `/etc/timezone` 是 `Asia/Beijing`、`PRC` 等 Chromium 不认的名字 | 开窗前映射为 `Asia/Shanghai`，否则页面时间全错 |
 | 缺终端模拟器 | 按 `deepin-terminal → x-terminal-emulator → gnome-terminal → konsole → xfce4-terminal` 依次降级，都没有则回退后台补齐 |
-| 原生目录对话框不一定存在 | 有 `zenity` / `kdialog` 才用原生，否则自动降级为浏览模式 |
+| 原生目录对话框不一定存在 | 有 `zenity` / `kdialog` 才用原生，否则自动降级为浏览模式；降级时**后端与客户端 surface 成对挂载**，「添加工作区」入口仍在 |
 | 首次双击被问「是否信任该应用」 | 已写入文档——「点了没反应」通常是这个询问，不是启动失败 |
 
 **验证环境**：UOS Desktop 20 Professional（专业版 `Y2020E0001`，内核 `4.19.0-amd64-desktop`，
@@ -555,6 +555,34 @@ npm 的完整输出会写进 `~/.dsh-desktop/runtime/npm-install-dsh.log`，失�
 export PATH="$(ls -d "$HOME"/.dsh-desktop/runtime/node-*/bin | head -1):$PATH"
 bash tools/bootstrap.sh install
 ```
+
+#### 侧栏没有「+ 添加工作区」按钮
+
+症状：侧栏「工作区」标题右边只有搜索和视图选项两个图标，找不到「添加工作区」；
+终端里也没有任何报错——因为入口**根本没渲染**，不是点击失败。
+
+原因：在 Linux 上没有 `zenity` / `kdialog` 时，本壳会把内核的
+`dsh-host-directory-picker-auto` 换成浏览模式。而一个目录选择器交互由**两个**
+Loader entry 组成——Host 后端（提供 `ctx.directoryPicker`）和客户端 surface（占用
+`sidebar.workspaces.directoryFlow` / `conversation.hero.workspace.directoryFlow` 槽位）。
+只挂后端的话，槽位没有占位者，`directoryFlowAvailable` 为 false，侧栏的「+」和
+新会话页的目录流都不会渲染。
+
+修复版会成对插入这两行，升级即可。如果暂时不能升级，可以手工补一行：
+编辑 `<用户数据目录>/shell.patch.yml`（一般在
+`~/.local/share/dsh-desktop/data-shell/shell.patch.yml`），在 `insert:` 列表里
+补上客户端 surface 那一行后重启：
+
+```yaml
+- insert:
+    - id: 'shell-directory-picker'
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: 'shell-directory-picker-surface'
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
+```
+
+另一条更省事的路：装上 `zenity` 或 `kdialog`（`sudo apt install zenity`），
+本壳就会走原生对话框，不再替换内核那一行。
 
 ---
 
