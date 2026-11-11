@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.22] — 2026-11-11
+
 ### 修复
 
 - **长时间使用后界面卡顿：忙碌检测不再对整页做二次方扫描**
