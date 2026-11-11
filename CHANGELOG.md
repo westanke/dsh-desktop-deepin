@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.21] — 2026-11-11
+
 ### 修复
 
 - **「添加工作区」入口消失：钉住目录选择器时必须成对插入后端与客户端 surface**
