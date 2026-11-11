@@ -469,17 +469,90 @@ install_electron() {
   return 1
 }
 
+# ── 让自举下来的 Node 排在 PATH 最前 ───────────────────────────────────
+# Node 官方压缩包里的 bin/npm、bin/dsh 都是 JS 脚本，首行 #!/usr/bin/env node：
+# 它们按 PATH 找解释器，而不是用「旁边那个 node」。bootstrap 以前只算出 NODE_BIN
+# 的绝对路径就 exec npm，PATH 一直没动，于是两类机器必坏：
+#   · PATH 上没有 node（纯净系统）→ /usr/bin/env: 'node': No such file or directory
+#   · PATH 上是 apt 装的旧 node（UOS / Debian 10 自带 nodejs 10.24）→ Node 24 的
+#     npm 11 被 Node 10 启动，立刻失败（npm 11 的 engines 要求 Node ≥ 20）
+# 两者都表现为「npm 安装失败」，且错误曾被 2>&1 吞掉 —— 这就是 Gitee IKSSLI
+# （UOS 1070 arm64）报的问题。把自举 Node 的目录前置是最小且确定的修法：它同时
+# 修好 npm / dsh / pnpm 三个靠 shebang 启动的工具，并随 export 传给子脚本。
+use_node_bin_on_path() {
+  [ -n "$NODE_BIN" ] || return 0
+  local node_dir
+  node_dir="$(dirname "$NODE_BIN")"
+  # 判据是「排在最前」而不是「在不在」：Node 目录若已在 PATH 里但排在旧 node
+  # 后面（比如用户自己的 ~/bin 在 /usr/bin 之后），那种情况同样会踩坑。
+  if [ "${PATH%%:*}" != "$node_dir" ]; then
+    PATH="$node_dir:$PATH"
+  fi
+  export PATH
+  # install-plugins.sh 的 PATH 自救把它当第一优先目录（见其 ensure_node_bin_on_path）。
+  DSH_NODE_BIN="$node_dir"; export DSH_NODE_BIN
+}
+
 install_dsh() {
   say "安装 dsh 内核（npm 国内源）…"
   [ -n "$NODE_BIN" ] || { bad "需要先有 Node"; return 1; }
-  local npm_bin
-  npm_bin="$(dirname "$NODE_BIN")/npm"
+  use_node_bin_on_path
+
+  local node_dir npm_bin log rc
+  node_dir="$(dirname "$NODE_BIN")"
+  npm_bin="$node_dir/npm"
   if [ ! -x "$npm_bin" ]; then
-    if have npm; then npm_bin="$(command -v npm)"; else bad "找不到 npm"; return 1; fi
+    # 官方 Node 一定带 npm；走到这里说明拿到的是裁剪过的 Node。退回系统 npm 可以，
+    # 但它同样由 #!/usr/bin/env node 启动，得靠上面已前置的 PATH 才跑得动。
+    if have npm; then
+      npm_bin="$(command -v npm)"
+      info "Node 旁没有 npm，改用 PATH 里的：$npm_bin"
+    else
+      bad "找不到 npm（Node 目录与 PATH 里都没有）"
+      return 1
+    fi
   fi
-  "$npm_bin" install --global --registry "$NPM_REGISTRY" @deepseek-ai/dsh@latest >/dev/null 2>&1 \
-    && { ok "dsh 已通过 npm 安装"; return 0; }
-  bad "npm 安装失败"
+
+  # 输出不再丢弃：issue 里只有「npm 安装失败」一句话，排查只能靠猜。日志落在
+  # 用户自己的 runtime 目录（不写 /tmp），失败时回显尾部。
+  mkdir -p "$RUNTIME_DIR"
+  log="$RUNTIME_DIR/npm-install-dsh.log"
+  : >"$log"
+
+  # 先自检：npm 能跑起来再谈装包。跑不起来时把「是谁在启动它」说清楚，
+  # 别再把一句「安装失败」丢给用户。
+  if ! "$npm_bin" --version >>"$log" 2>&1; then
+    bad "npm 无法运行：$npm_bin"
+    say "  当前 PATH 首位：${PATH%%:*}"
+    say "  npm 的首行是 #!/usr/bin/env node，它会按 PATH 找 node。"
+    say "  自检输出：$log"
+    say "  可先执行 export PATH=\"$node_dir:\$PATH\" 再重试本脚本。"
+    return 1
+  fi
+  info "日志：$log"
+
+  "$npm_bin" install --global --registry "$NPM_REGISTRY" @deepseek-ai/dsh@latest >>"$log" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "dsh 已通过 npm 安装（日志：$log）"
+    # 立刻补上检测结果，让后面的 writeback 一次就把 systemDsh 写对，
+    # 而不是等下一次 start-shell.sh 再回填。
+    if [ -x "$node_dir/dsh" ]; then
+      DSH_BIN="$node_dir/dsh"
+      DSH_KERNEL_BIN="$DSH_BIN"; export DSH_KERNEL_BIN
+    fi
+    return 0
+  fi
+
+  bad "npm 安装失败（退出码 $rc）"
+  say "  完整日志：$log"
+  say "  最后 15 行："
+  tail -n 15 "$log" 2>/dev/null | sed 's/^/    /'
+  say ""
+  say "  常见原因："
+  say "    · 网络/镜像不可达：换网络后重试，镜像地址 ${NPM_REGISTRY}"
+  say "    · 启动 npm 的 Node 不对：本脚本已把 $node_dir 放到 PATH 最前，仍有问题请贴上面日志"
+  say "    · 权限不足：$RUNTIME_DIR 应归当前用户所有"
   return 1
 }
 
