@@ -10,6 +10,7 @@
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { mkdir, symlink, cp } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, protocol, screen, shell } from 'electron'
@@ -401,8 +402,18 @@ async function addHomeFromPicker() {
   const target = mainWindow
   if (target === null || target.isDestroyed()) return
 
+  // `defaultPath` decides where the dialog opens. Electron 43 changed the
+  // fallback to the user's Downloads directory, and the OS no longer remembers
+  // the last pick — so without an explicit path the dialog would jump away from
+  // wherever the user actually keeps their kernel homes. Anchor it on the home
+  // that is in use right now, and fall back to the user's home directory when
+  // that one is not a readable directory (first launch, deleted home).
+  const anchor = dshHome
+  const defaultPath = anchor !== '' && existsSync(anchor) ? anchor : homedir()
+
   const result = await dialog.showOpenDialog(target, {
     title: '选择用作内核 Home 的目录',
+    defaultPath,
     properties: ['openDirectory', 'createDirectory'],
   })
   if (result.canceled) return

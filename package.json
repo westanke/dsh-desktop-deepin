@@ -1,7 +1,7 @@
 {
   "name": "deepseek-harness-deepin",
   "productName": "DeepSeek Harness Desktop",
-  "version": "0.2.22",
+  "version": "0.2.23",
   "description": "Deepin/UOS desktop shell for the DeepSeek Harness (dsh) agent runtime — community-maintained Linux build of the official desktop shell.",
   "license": "MIT",
   "type": "module",
@@ -40,7 +40,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
-    "electron": "^43.4.0",
+    "electron": "^45.3.0",
     "typescript": "^5.9.3"
   }
 }

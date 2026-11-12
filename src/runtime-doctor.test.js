@@ -12,6 +12,7 @@ import { delimiter, join } from 'node:path'
 import {
   MIN_ELECTRON_MAJOR,
   MIN_NODE_VERSION,
+  WANTED_ELECTRON_VERSION,
   conventionalDirs,
   detectRuntime,
   findBinary,
@@ -184,6 +185,50 @@ describe('detectRuntime', () => {
       }),
     })
     assert.equal(report.electron.ok, false)
+  })
+
+  it('flags an Electron that is usable but older than the wanted release', () => {
+    const report = detectRuntime({
+      ...happy,
+      platform: 'linux',
+      runVersion: versionsOf({
+        [join('/usr/bin', 'electron')]: 'v33.3.0',
+        [join('/usr/bin', 'node')]: 'v24.19.0',
+        [join('/usr/bin', 'dsh')]: '0.2.0-rc.1',
+      }),
+    })
+    // Usable — it is above the floor — but not the release we verified against.
+    assert.equal(report.electron.ok, true)
+    assert.equal(report.electronOutdated, true)
+    assert.deepEqual(report.missing, [])
+  })
+
+  it('does not flag the wanted Electron release as outdated', () => {
+    const report = detectRuntime({
+      ...happy,
+      platform: 'linux',
+      runVersion: versionsOf({
+        [join('/usr/bin', 'electron')]: WANTED_ELECTRON_VERSION,
+        [join('/usr/bin', 'node')]: 'v24.19.0',
+        [join('/usr/bin', 'dsh')]: '0.2.0-rc.1',
+      }),
+    })
+    assert.equal(report.electron.ok, true)
+    assert.equal(report.electronOutdated, false)
+  })
+
+  it('does not flag a newer Electron release as outdated', () => {
+    const report = detectRuntime({
+      ...happy,
+      platform: 'linux',
+      runVersion: versionsOf({
+        [join('/usr/bin', 'electron')]: 'v99.0.0',
+        [join('/usr/bin', 'node')]: 'v24.19.0',
+        [join('/usr/bin', 'dsh')]: '0.2.0-rc.1',
+      }),
+    })
+    assert.equal(report.electron.ok, true)
+    assert.equal(report.electronOutdated, false)
   })
 
   it('accepts any dsh, however new', () => {

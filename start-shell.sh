@@ -43,6 +43,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # 依赖的最低版本，与 tools/bootstrap.sh 保持一致
 NODE_MIN_MAJOR=22; NODE_MIN_MINOR=15
 ELECTRON_MIN_MAJOR=33
+# 本壳按这一版 Electron 验证过（与 tools/bootstrap.sh 的 ELECTRON_WANT 一致）。
+# MIN_MAJOR 是对外承诺的「能跑的最低版本」，两者不是一回事：只有 MIN_MAJOR
+# 的话，config.json 里记着的旧版绝对路径会让升级后的壳一直跑旧 Electron。
+ELECTRON_WANT="v45.3.0"
 
 [ -f "$CONFIG" ] || err "配置文件缺失: $CONFIG"
 
@@ -94,6 +98,39 @@ version_ge() {
   [ "$aj" -ge "$bj" ]
 }
 
+# 三段全比（major.minor.patch）。version_ge 只比到 minor，拿它比两个具体
+# 版本号会把 45.3.0 与 45.9.0 判成相等。
+version_ge3() {
+  local a="$1" b="$2" am aj ap bm bj bp
+  am=$(printf '%s' "$a" | sed -n 's/^v\{0,1\}\([0-9]*\)\..*/\1/p')
+  aj=$(printf '%s' "$a" | sed -n 's/^v\{0,1\}[0-9]*\.\([0-9]*\)\..*/\1/p')
+  ap=$(printf '%s' "$a" | sed -n 's/^v\{0,1\}[0-9]*\.[0-9]*\.\([0-9]*\).*/\1/p')
+  bm=$(printf '%s' "$b" | sed -n 's/^v\{0,1\}\([0-9]*\)\..*/\1/p')
+  bj=$(printf '%s' "$b" | sed -n 's/^v\{0,1\}[0-9]*\.\([0-9]*\)\..*/\1/p')
+  bp=$(printf '%s' "$b" | sed -n 's/^v\{0,1\}[0-9]*\.[0-9]*\.\([0-9]*\).*/\1/p')
+  [ -z "$am" ] && am=0; [ -z "$aj" ] && aj=0; [ -z "$ap" ] && ap=0
+  [ -z "$bm" ] && bm=0; [ -z "$bj" ] && bj=0; [ -z "$bp" ] && bp=0
+  [ "$am" -gt "$bm" ] && return 0
+  [ "$am" -lt "$bm" ] && return 1
+  [ "$aj" -gt "$bj" ] && return 0
+  [ "$aj" -lt "$bj" ] && return 1
+  [ "$ap" -ge "$bp" ]
+}
+
+# 取一个 Electron 的版本号。优先读发行包自带的 version 文件：纯文本、零进程
+# 开销，且不受 ELECTRON_RUN_AS_NODE 污染（该变量为 1 时 Electron 以 Node
+# 模式运行，--version 报的是内捆的 Node 版本，实测 Electron 33 报 v20.18.1）。
+electron_version() {
+  local bin="$1" vf v=""
+  vf="$(dirname "$bin")/version"
+  if [ -f "$vf" ]; then
+    v="$(head -1 "$vf" 2>/dev/null)"
+    [ -n "$v" ] && { printf 'v%s' "${v#v}"; return 0; }
+  fi
+  v="$(env -u ELECTRON_RUN_AS_NODE "$bin" --version 2>/dev/null | head -1)"
+  printf '%s' "$v"
+}
+
 # ── 内核 dsh 与桌面壳启动器的区分 ───────────────────────────────────────
 # 桌面壳会把「启动本壳」的命令发布成 ~/.local/bin/dsh（见 src/cli-command.js
 # 的 COMMAND_NAME），那是一个百来字节的 sh shim：
@@ -140,6 +177,8 @@ ensure_node_bin_on_path
 # ── 检测三个运行时 ─────────────────────────────────────────────────────
 # 输出：ELECTRON_OK / NODE_OK / DSH_OK 三个变量，以及它们的路径。
 ELECTRON=""; NODE_BIN=""; SYSTEM_DSH=""
+# 检测到的 Electron 版本低于本壳验证过的那一版时置 1（能跑，但该升级）。
+ELECTRON_OUTDATED=0
 
 detect() {
   local cfg_e cfg_d cfg_n
@@ -147,14 +186,61 @@ detect() {
   cfg_d="$(config_value systemDsh || true)"
   cfg_n="$(config_value nodeBinDir || true)"
 
-  # 每项按 配置 → PATH → 常见位置 → 私有 runtime 目录 依次查找
-  if [ -n "$cfg_e" ] && [ -x "$cfg_e" ]; then ELECTRON="$cfg_e"
-  elif have electron; then ELECTRON="$(command -v electron)"
-  else
-    local c
-    for c in /usr/bin/electron /usr/local/bin/electron "$RUNTIME_DIR"/electron-*/electron; do
-      [ -x "$c" ] && { ELECTRON="$c"; break; }
-    done
+  # 每项按 配置 → PATH → 常见位置 → 私有 runtime 目录 依次查找。
+  # Electron 例外，两条规则：
+  #  1) 自举目录里可能同时躺着好几版（升级前 v33.3.0，升级后 v45.3.0），
+  #     glob 按字典序展开，旧版排在前面——挑版本号最大的那个，不是第一个
+  #     能执行的。
+  #  2) config.json 里记的是绝对路径，用户升级壳之后那一条还指着旧版本，
+  #     「配置优先」会让人一直跑旧 Electron。所以配置里的路径要过版本关：
+  #     够新就照用（用户可能故意钉某个版本）；不够新但机器上已有更新的一版，
+  #     用更新的；都没有就先用旧版继续跑，由 bootstrap 去升级。
+  local e_best="" e_ver="" e_cfg="" e_cfgver=""
+  local c
+  # 候选顺序与 tools/bootstrap.sh 的 detect() 保持一致：系统级 → 版本管理器
+  # （nvm/fnm/volta/asdf/nvs/n）→ 用户级 → 第三方包管理器 → 自举私有目录。
+  # 两处必须是同一份名单，否则 bootstrap 装好的运行时 start-shell.sh 认不出，
+  # 表现为「下载完还是说缺 electron」。glob 未匹配时保持原样，[ -x ] 自然跳过。
+  # /usr/lib/electron/electron 是 deepin/UOS 发行版打包的位置，在 PATH 之外，
+  # 漏掉它会让「系统已经装了 electron」的用户白等一次约 180MB 的下载。
+  for c in /usr/bin/electron /usr/local/bin/electron /usr/lib/electron/electron \
+           /opt/electron/electron /opt/electron*/electron /snap/bin/electron \
+           "${HOME}/.local/bin/electron" "${HOME}/.local/share/electron/"*/electron \
+           "${HOME}/.cache/electron/"*/electron \
+           "${HOME}/.nvm/versions/node/"*/lib/node_modules/electron/dist/electron \
+           "$RUNTIME_DIR"/electron-*/electron; do
+    [ -x "$c" ] || continue
+    local cv; cv="$(electron_version "$c")"
+    if [ -z "$e_best" ] || version_ge3 "$cv" "$e_ver"; then
+      e_best="$c"; e_ver="$cv"
+    fi
+  done
+  # PATH 上的 electron 也算一个候选（发行版包装的常常不在上面的名单里）
+  if have electron; then
+    local cp; cp="$(command -v electron)"
+    if [ -x "$cp" ]; then
+      local cv; cv="$(electron_version "$cp")"
+      if [ -z "$e_best" ] || version_ge3 "$cv" "$e_ver"; then
+        e_best="$cp"; e_ver="$cv"
+      fi
+    fi
+  fi
+  # 配置里的路径：够新就优先（用户钉版本），不够新则让位给已更新的那一版
+  if [ -n "$cfg_e" ] && [ -x "$cfg_e" ]; then
+    e_cfg="$cfg_e"
+    e_cfgver="$(electron_version "$cfg_e")"
+    if version_ge3 "$e_cfgver" "$ELECTRON_WANT"; then
+      e_best="$cfg_e"; e_ver="$e_cfgver"
+    elif [ -n "$e_best" ] && version_ge3 "$e_ver" "$e_cfgver"; then
+      : # 机器上已有更新的版本，用它
+    else
+      e_best="$cfg_e"; e_ver="$e_cfgver"
+    fi
+  fi
+  if [ -n "$e_best" ]; then
+    ELECTRON="$e_best"
+    # 挑中的这版比本壳验证过的版本旧 → 标为待升级（verify() 里再确认一次）。
+    version_ge3 "$e_ver" "$ELECTRON_WANT" || ELECTRON_OUTDATED=1
   fi
 
   if [ -n "$cfg_n" ] && [ -x "$cfg_n/node" ]; then NODE_BIN="$cfg_n/node"
@@ -225,8 +311,22 @@ detect() {
 # 版本是否满足要求；不满足则清空对应变量
 verify() {
   if [ -n "$ELECTRON" ]; then
-    local v; v="$("$ELECTRON" --version 2>/dev/null | head -1)"
-    version_ge "$v" "v${ELECTRON_MIN_MAJOR}.0" || { ELECTRON=""; }
+    # Electron with ELECTRON_RUN_AS_NODE=1 runs as plain Node, and then
+    # `--version` answers with the bundled Node version (20.18.1 for Electron
+    # 33) instead of the Electron version. Any process spawned from inside the
+    # shell inherits that variable, so the launcher would read "v20.18.1",
+    # fail the >= 33 check and claim Electron is missing — after it had just
+    # been downloaded. Clearing the variable for the probe is what the shell
+    # itself does before exec'ing Electron. The packaged `version` file is
+    # preferred over the probe: plain text, zero process cost, same answer.
+    local v; v="$(electron_version "$ELECTRON")"
+    if ! version_ge "$v" "v${ELECTRON_MIN_MAJOR}.0"; then
+      ELECTRON=""
+    elif ! version_ge3 "$v" "$ELECTRON_WANT"; then
+      # 能跑，但比本壳验证过的版本旧。旧版先继续用（不打断用户），升级交给
+      # bootstrap：它知道要去哪下载。
+      ELECTRON_OUTDATED=1
+    fi
   fi
   if [ -n "$NODE_BIN" ]; then
     local v; v="$("$NODE_BIN" --version 2>/dev/null | head -1)"
@@ -309,6 +409,23 @@ if [ -n "$MISSING" ]; then
 请手动检查：bash $BOOTSTRAP check"
   say ""
   ok "运行时已全部就绪"
+fi
+
+# ── 旧版 Electron 的升级 ─────────────────────────────────────────────────
+# 机器上有一个能跑的旧版本，但它不是本壳验证过的那一版。旧版本继续用也能跑，
+# 但壳升级了而 Electron 没跟着升级，等于这次升级白做——所以要把它换掉。
+# 与「缺失」分开处理：缺失必须先补齐才能启动，旧版是可以先跑起来再换。
+#
+# 后台换（不打断用户当前的启动）：180MB 的下载不该把人拦在门外。
+# 用 setsid 脱离当前进程组——本脚本随后会 exec Electron 换掉自己，
+# 父进程一死，普通后台任务会被一起收掉。
+#
+# 失败不致命：旧版本还在，下次启动还会再试。
+if [ "$ELECTRON_OUTDATED" = "1" ] && [ -x "$BOOTSTRAP" ]; then
+  say ""
+  info "Electron 版本较旧（$(electron_version "$ELECTRON")），正在后台升级到 $ELECTRON_WANT…"
+  setsid nohup bash "$BOOTSTRAP" install >"$RUNTIME_DIR/electron-upgrade.log" 2>&1 &
+  say "  （进度：$RUNTIME_DIR/electron-upgrade.log；升级后下次启动生效）"
 fi
 
 # ── 推荐插件：检查 + 可见补齐 ────────────────────────────────────────────

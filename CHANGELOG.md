@@ -6,6 +6,84 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.23] — 2026-11-12
+
+### 变更
+
+- **Electron 运行时从 33.3.0 升到 45.3.0（Chromium 130 → 156，Node 20.18 → 24.22）**
+  实际运行的壳一直是 33.3.0（`tools/bootstrap.sh` 的 `ELECTRON_WANT` 与
+  `src/runtime-install.js` 的 `DEFAULT_ELECTRON_VERSION`），落后 12 个大版本。
+  本机实测（真实显示 `:0`、硬件 GPU、同页交错 5 轮取中位）：
+  页面加载 392 ms → 188 ms（快 52.0%）、冷启动 542 ms → 292 ms（快 46.1%）、
+  `querySelectorAll('*')` 快 31.2%、微任务 churn 快 33.3%、全进程 RSS
+  487.6 MB → 465.8 MB（省 4.5%）。
+  GPU 路径未降级：两侧都是 `ANGLE (Glenfly Arise1020, OpenGL 4.5)`。
+  对照官方 Breaking Changes 全文逐项核过，**没有硬阻断**；内核不跑在
+  Electron 的 Node 上（走独立的 `node-v24.19.0`），所以 agent 执行速度不受影响，
+  端到端启动只快 2.4%（4.5 s 里大头是内核启动）。
+  下载量由 106 MB 增至 124 MB（+16.4%），解包后 263 MB → 274 MB。
+  `MIN_ELECTRON_MAJOR` 仍是 33（它是**下限**，已装 33 的用户照旧能用），
+  README 的「Electron ≥ 33」口径不变。
+
+- **忙碌检测改为增量追踪：不再每次 DOM 变动都整页重扫**
+  0.2.22 把整页扫描换成了 `TreeWalker`，但每来一次 DOM 变动仍然重扫全页；
+  而内核在流式输出时每秒会改十几次。实测（11k 元素长会话页面）：
+  旧实现每次回调 11.7 ms、占 wall clock **13.7%**（Electron 45 上 9.7 ms / 11.3%）；
+  现改为记录「命中的文本节点」，用 mutation 记录增量维护，
+  每次回调 1.03 ms（Electron 33）/ **0.215 ms（Electron 45）**，
+  占 wall clock 1.2% / **0.25%**——比旧实现快约 11 倍（E45）到 45 倍（E33）。
+  一次插入 300 个节点：12.2 ms → 2.0 ms（E33）、9.6 ms → 1.1 ms（E45）。
+  正确性用「每次变动后与全量重扫对拍」验证：14 个确定性用例全部一致。
+
+- **4 条提示词正则合并为 1 条**
+  `/generating/i`、`/thinking\.{0,3}$/i`、`/思考中/i`、`/生成中/i` 合成一条
+  alternation。全量扫描从 3.9 ms 降到 1.8 ms（Electron 45 实测 1.74 ms，快 42.6%）。
+  顺带把「先用 `indexOf` 预筛」这个想法否掉了：实测多跑 6 次 `indexOf`
+  反而慢 59–69%；把 8 次 `querySelector` 合成一条逗号选择器也慢 27%。
+  这两条实测结论写进了代码注释，免得下次再走一遍。
+
+- **旧装机现在会真的把 Electron 升上去（此前升级等于没发生）**
+  `MIN_ELECTRON_MAJOR=33` 是**下限**：已经在 33.3.0 上的机器跑 `bootstrap.sh check`
+  会通过，于是不会去下载新版本；而 `config.json` 里记的还是 v33.3.0 的绝对路径，
+  启动时照旧用它——壳升级了，Electron 却停在原地。
+  现在把「能跑的最低版本」（下限，对外承诺）与「本壳验证过的版本」（事实）分开：
+
+  - 新增 `ELECTRON_WANT`（v45.3.0）与 `version_ge3()`（major.minor.patch 三段全比，
+    原来的 `version_ge` 只比到 minor，拿它比两个具体版本号会把 45.3.0 和 45.9.0
+    判成相等）。
+  - `start-shell.sh` 检测 Electron 时不再「取第一个能执行的」，而是在所有候选里
+    **挑版本号最大的**；`config.json` 里那条旧路径要先过版本关：够新就照用
+    （用户可能故意钉版本），不够新但机器上已有更新的就用更新的。
+  - 旧版本**不打断启动**：`start-shell.sh` 在后台（`setsid`）跑一次
+    `bootstrap.sh install` 把新版拉下来，失败也不致命（旧版还在，下次再试）；
+    `bootstrap.sh` 的提示语也区分「缺失」与「可升级」，不再让用户以为从没装过。
+  - `tools/doctor.js` 同步：`npm run doctor` 会指出「Electron X 可用，但低于本壳
+    验证过的 v45.3.0」，`--install` 也会把它换掉。
+  - `src/runtime-doctor.js` 新增 `WANTED_ELECTRON_VERSION` 与 `electronOutdated`
+    标志，并有 3 个单元测试覆盖（旧版本标记为待升级、目标版本与更新版本不标记）。
+
+  实测（真实 `start-shell.sh` 逻辑，假 runtime 目录）：只有 v33 时选中 v33 且
+  标记待升级；有 v45 时选中 v45 且不标记；`config.json` 指向一个不存在的路径时
+  回落到实际存在的 v33 并标记待升级。
+
+### 修复
+
+- **Electron 版本探测可能被 `ELECTRON_RUN_AS_NODE` 污染，误判「缺 Electron」**
+  该变量存在时，Electron 以 Node 模式运行，`--version` 报的是它自带的 Node
+  版本（33.3.0 会报成 v20.18.1），于是 `start-shell.sh` 会以为「系统里没有
+  合格的 Electron」，白下 180 MB。`start-shell.sh` 的探测已加 `env -u`，
+  `tools/doctor.js` 的 `versionOf()` 也改成剔除该变量后再执行。
+
+- **找不到 `/usr/lib/electron/electron`，让已装 Electron 的用户白等一次下载**
+  `start-shell.sh` 的候选名单只有 3 个位置，漏掉了发行版打包路径
+  （`/usr/lib/electron/electron` 在 PATH 之外）和 `~/.dsh-desktop/runtime/` 下的
+  已装版本。现已与 `tools/bootstrap.sh` 的名单对齐。
+
+- **选目录对话框在 Electron 43 之后会跳到「下载」目录**
+  Electron 43 起 `dialog.showOpenDialog` 不传 `defaultPath` 时默认打开下载目录，
+  而且系统不再记住上次选的位置。现显式传 `defaultPath`：优先当前生效的内核
+  Home 目录，不可用时退回用户主目录。
+
 ## [0.2.22] — 2026-11-11
 
 ### 修复

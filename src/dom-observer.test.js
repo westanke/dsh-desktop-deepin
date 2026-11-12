@@ -35,11 +35,36 @@ import { OBSERVER_SOURCE } from './dom-observer.js'
  * element re-concatenates every subtree, so the cost grows with
  * elements * text.
  *
+ * `treeWalkerCalls` counts how often the script walks the tree. The observer
+ * must not re-walk the whole page for every DOM change: that is the cost
+ * that made a streaming turn pin the renderer.
+ *
  * @param {FakeNode[]} spec
  */
 function buildDom(spec) {
-  const stats = { textContentReads: 0, textContentReadsByTag: /** @type {Record<string, number>} */ ({}) }
+  const stats = {
+    textContentReads: 0,
+    textContentReadsByTag: /** @type {Record<string, number>} */ ({}),
+    treeWalkerCalls: 0,
+    querySelectorCalls: 0,
+  }
   let nextId = 1
+
+  /** @type {any} */
+  let root = null
+
+  /**
+   * @param {any} node
+   * @returns {boolean}
+   */
+  const isConnected = (node) => {
+    let current = node
+    while (current) {
+      if (current === root) return true
+      current = current.parentElement
+    }
+    return false
+  }
 
   /**
    * @param {FakeNode} node
@@ -52,12 +77,56 @@ function buildDom(spec) {
     const element = {
       nodeType: 1,
       tagName: node.tag ?? 'DIV',
-      __attrs: node.attrs ?? {},
+      __attrs: { ...(node.attrs ?? {}) },
       __class: node.class ?? '',
       children,
       childNodes: children,
       parentElement: null,
       parentNode: null,
+      get isConnected() {
+        return isConnected(element)
+      },
+      get className() {
+        return element.__class
+      },
+      set className(value) {
+        element.__class = value
+      },
+      /**
+       * @param {string} name
+       * @param {string} value
+       */
+      setAttribute(name, value) {
+        element.__attrs[name] = String(value)
+      },
+      /**
+       * @param {string} name
+       * @returns {string | null}
+       */
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(element.__attrs, name)
+          ? element.__attrs[name]
+          : null
+      },
+      /**
+       * @param {any} child
+       */
+      appendChild(child) {
+        child.parentElement = element
+        child.parentNode = element
+        children.push(child)
+        return child
+      },
+      /**
+       * @param {any} child
+       */
+      removeChild(child) {
+        const index = children.indexOf(child)
+        if (index >= 0) children.splice(index, 1)
+        child.parentElement = null
+        child.parentNode = null
+        return child
+      },
       get textContent() {
         stats.textContentReads++
         stats.textContentReadsByTag[element.tagName] =
@@ -76,40 +145,60 @@ function buildDom(spec) {
     }
 
     if (node.text !== undefined) {
-      const textNode = {
-        nodeType: 3,
-        nodeValue: node.text,
-        parentElement: element,
-        parentNode: element,
-        get textContent() {
-          return node.text
-        },
-      }
+      const textNode = createTextNode(node.text)
+      textNode.parentElement = element
+      textNode.parentNode = element
       children.push(textNode)
     }
 
     return element
   }
 
-  const root = create({ tag: 'BODY', children: spec })
-  /** @type {any[]} */
-  const allElements = []
-  /** @type {any[]} */
-  const allTextNodes = []
+  /**
+   * @param {string} text
+   * @returns {any}
+   */
+  const createTextNode = (text) => ({
+    nodeType: 3,
+    nodeValue: text,
+    parentElement: null,
+    parentNode: null,
+    get isConnected() {
+      return isConnected(this)
+    },
+    get textContent() {
+      return this.nodeValue
+    },
+  })
+
+  root = create({ tag: 'BODY', children: spec })
+
   /**
    * @param {any} node
+   * @param {any[]} out
+   * @returns {any[]}
    */
-  const walk = (node) => {
-    for (const child of node.children ?? []) {
-      if (child.nodeType === 1) {
-        allElements.push(child)
-        walk(child)
-      } else {
-        allTextNodes.push(child)
-      }
+  const collectTextNodes = (node, out) => {
+    if (node.nodeType === 3) {
+      out.push(node)
+      return out
     }
+    for (const child of node.children ?? []) collectTextNodes(child, out)
+    return out
   }
-  walk(root)
+
+  /**
+   * @param {any} node
+   * @param {any[]} out
+   * @returns {any[]}
+   */
+  const collectElements = (node, out) => {
+    if (node.nodeType === 1) {
+      out.push(node)
+      for (const child of node.children ?? []) collectElements(child, out)
+    }
+    return out
+  }
 
   const document = {
     body: root,
@@ -117,7 +206,9 @@ function buildDom(spec) {
      * @param {string} selector
      */
     querySelector(selector) {
+      stats.querySelectorCalls++
       // Only the busy selectors are supported; anything else returns null.
+      const allElements = collectElements(root, [])
       const match = allElements.find((el) => {
         const attr = /^\[([^\]=]+)(?:=["']?([^\]"']*)["']?)?\]$/.exec(selector)
         if (attr) return el.__attrs?.[attr[1] ?? ''] === (attr[2] ?? '')
@@ -127,24 +218,39 @@ function buildDom(spec) {
       return match ?? null
     },
     querySelectorAll() {
-      return allElements
+      return collectElements(root, [])
+    },
+    /**
+     * @param {string} tag
+     * @returns {any}
+     */
+    createElement(tag) {
+      return create({ tag })
+    },
+    /**
+     * @param {string} text
+     * @returns {any}
+     */
+    createTextNode(text) {
+      return createTextNode(text)
     },
     /**
      * @param {any} _root
      * @param {number} whatToShow
      */
     createTreeWalker(_root, whatToShow) {
+      stats.treeWalkerCalls++
+      const nodes = whatToShow === 4 /* NodeFilter.SHOW_TEXT */ ? collectTextNodes(_root, []) : []
       let index = 0
       return {
         nextNode() {
-          if (whatToShow !== 4 /* NodeFilter.SHOW_TEXT */) return null
-          return allTextNodes[index++] ?? null
+          return nodes[index++] ?? null
         },
       }
     },
   }
 
-  return { document, stats }
+  return { document, stats, root, createTextNode }
 }
 
 /**
@@ -153,16 +259,19 @@ function buildDom(spec) {
  * @param {FakeNode[]} spec
  */
 function runObserver(spec) {
-  const { document, stats } = buildDom(spec)
+  const { document, stats, root, createTextNode } = buildDom(spec)
   /** @type {boolean[]} */
   const reported = []
+  /** @type {any[]} */
+  const observers = []
   const sandbox = {
     document,
     NodeFilter: { SHOW_TEXT: 4 },
     MutationObserver: class {
-      /** @param {() => void} callback */
+      /** @param {(records: any[]) => void} callback */
       constructor(callback) {
         this.callback = callback
+        observers.push(this)
       }
       observe() {}
       disconnect() {}
@@ -182,7 +291,21 @@ function runObserver(spec) {
   }
   vm.createContext(sandbox)
   vm.runInContext(OBSERVER_SOURCE, sandbox)
-  return { reported, stats }
+  return {
+    reported,
+    stats,
+    root,
+    createTextNode,
+    /**
+     * Deliver a set of mutation records to the observer, the way the browser
+     * would after the DOM changed.
+     *
+     * @param {any[]} records
+     */
+    mutate(records) {
+      for (const observer of observers) observer.callback(records)
+    },
+  }
 }
 
 describe('OBSERVER_SOURCE', () => {
@@ -219,7 +342,13 @@ describe('OBSERVER_SOURCE', () => {
   })
 
   it('keeps the text patterns as a fallback for unknown kernels', () => {
-    for (const pattern of ['/generating/i', '/thinking', '/思考中/i', '/生成中/i']) {
+    // One alternation instead of four separate patterns: four regex tests per
+    // text node were 2.9 ms of a 3.9 ms scan on an 11k-element page.
+    assert.ok(
+      OBSERVER_SOURCE.includes('BUSY_TEXT_PATTERN'),
+      'the observer must keep a text pattern',
+    )
+    for (const pattern of ['generating', 'thinking', '思考中', '生成中']) {
       assert.ok(OBSERVER_SOURCE.includes(pattern), `missing pattern ${pattern}`)
     }
   })
@@ -291,5 +420,93 @@ describe('the observer against a fake DOM', () => {
       { tag: 'DIV', text: 'three' },
     ])
     assert.equal(reported.length, 1)
+  })
+})
+
+describe('the observer tracks the busy text incrementally', () => {
+  it('walks the page once on load', () => {
+    const { stats } = runObserver([
+      { tag: 'DIV', text: 'one' },
+      { tag: 'DIV', text: 'two' },
+    ])
+    assert.equal(stats.treeWalkerCalls, 1)
+  })
+
+  it('does not re-walk the page when the text changes', () => {
+    // This is the hot path: the kernel rewrites the streaming answer many
+    // times per second. Re-scanning the whole page on every write is what
+    // pinned the renderer during a long session.
+    const { stats, root, createTextNode, mutate } = runObserver([
+      { tag: 'DIV', text: 'one' },
+    ])
+    const before = stats.treeWalkerCalls
+
+    const text = createTextNode('生成中')
+    root.appendChild(text)
+    mutate([
+      { type: 'childList', addedNodes: [text], removedNodes: [] },
+    ])
+
+    assert.equal(stats.treeWalkerCalls, before, 'a text change must not re-walk the page')
+  })
+
+  it('notices busy text that appears while the session runs', () => {
+    const { reported, root, createTextNode, mutate } = runObserver([
+      { tag: 'DIV', text: 'one' },
+    ])
+    assert.deepEqual(reported, [false])
+
+    const text = createTextNode('生成中')
+    root.appendChild(text)
+    mutate([{ type: 'childList', addedNodes: [text], removedNodes: [] }])
+
+    assert.deepEqual(reported, [false, true])
+  })
+
+  it('notices busy text that changes in place', () => {
+    // The kernel streams an answer by rewriting one text node over and
+    // over; the observer has to see the new wording without re-walking.
+    const { reported, root, createTextNode, mutate } = runObserver([
+      { tag: 'DIV', text: 'one' },
+    ])
+    const text = createTextNode('one')
+    root.appendChild(text)
+    mutate([{ type: 'childList', addedNodes: [text], removedNodes: [] }])
+
+    text.nodeValue = '思考中...'
+    mutate([{ type: 'characterData', target: text }])
+
+    assert.deepEqual(reported, [false, true])
+  })
+
+  it('clears the busy state when the busy text leaves the page', () => {
+    const { reported, root, createTextNode, mutate } = runObserver([
+      { tag: 'DIV', text: 'one' },
+    ])
+    const text = createTextNode('生成中')
+    root.appendChild(text)
+    mutate([{ type: 'childList', addedNodes: [text], removedNodes: [] }])
+    assert.deepEqual(reported, [false, true])
+
+    root.removeChild(text)
+    mutate([{ type: 'childList', addedNodes: [], removedNodes: [text] }])
+
+    assert.deepEqual(reported, [false, true, false])
+  })
+
+  it('costs one selector query per check, not one page walk', () => {
+    const { stats, root, createTextNode, mutate } = runObserver([
+      { tag: 'DIV', text: 'one' },
+    ])
+    const queriesBefore = stats.querySelectorCalls
+    const walksBefore = stats.treeWalkerCalls
+
+    const text = createTextNode('生成中')
+    root.appendChild(text)
+    mutate([{ type: 'childList', addedNodes: [text], removedNodes: [] }])
+
+    const queries = stats.querySelectorCalls - queriesBefore
+    assert.ok(queries <= 8, `expected at most 8 selector queries, saw ${queries}`)
+    assert.equal(stats.treeWalkerCalls, walksBefore)
   })
 })

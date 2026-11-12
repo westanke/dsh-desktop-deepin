@@ -27,6 +27,10 @@ USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dsh-desktop"
 USER_CONFIG="$USER_CONFIG_DIR/config.json"
 RUNTIME_DIR="${HOME}/.dsh-desktop/runtime"
 
+# 检测结果里的 Electron 状态：空 = 没找到；1 = 找到了但版本旧于本壳要装的
+# 那版（能跑，该升级）；2 = 找到了且版本达标。
+ELECTRON_OUTDATED=0
+
 # 国内镜像（全部实测可用）。顺序即优先级。
 NODE_MIRRORS=(
   "https://npmmirror.com/mirrors/node"
@@ -43,7 +47,13 @@ NPM_REGISTRY="https://registry.npmmirror.com"
 NODE_WANT="v24.19.0"
 NODE_MIN_MAJOR=22
 NODE_MIN_MINOR=15
-ELECTRON_WANT="v33.3.0"
+# ELECTRON_WANT 是「本壳默认要装的那一版」；ELECTRON_MIN_MAJOR 是「能跑的最低
+# 主版本」（对外承诺：装 33 也能跑，别把用户挡在门外）。两者不是一回事：
+#   - 低于 MIN_MAJOR → 不可用，必须换；
+#   - 高于 MIN_MAJOR 但低于 WANT → 能跑，但本壳已经按 WANT 验证过，应当升级。
+# 只看 MIN_MAJOR 的话，升级壳之后的老用户会一直卡在旧 Electron 上：版本判定
+# 通过 → 不下载 → 仍跑旧版本，升级等于没发生。
+ELECTRON_WANT="v45.3.0"
 ELECTRON_MIN_MAJOR=33
 
 say()  { printf '%s\n' "$*"; }
@@ -227,6 +237,28 @@ version_ge() {
   [ "$aj" -ge "$bj" ]
 }
 
+# ── 版本比较：a >= b（major.minor.patch 三段全比）────────────────────────
+# version_ge 只比到 minor（够用于「≥ 某个最低要求」），但拿它比两个具体版本号
+# 会出现 45.3.0 与 45.9.0 判成相等的情况。判断「装的是不是本壳要的那一版」
+# 需要精确到 patch，故另有一份。
+version_ge3() {
+  local a="$1" b="$2"
+  local am aj ap bm bj bp
+  am=$(printf '%s' "$a" | sed -n 's/^v\{0,1\}\([0-9]*\)\..*/\1/p')
+  aj=$(printf '%s' "$a" | sed -n 's/^v\{0,1\}[0-9]*\.\([0-9]*\)\..*/\1/p')
+  ap=$(printf '%s' "$a" | sed -n 's/^v\{0,1\}[0-9]*\.[0-9]*\.\([0-9]*\).*/\1/p')
+  bm=$(printf '%s' "$b" | sed -n 's/^v\{0,1\}\([0-9]*\)\..*/\1/p')
+  bj=$(printf '%s' "$b" | sed -n 's/^v\{0,1\}[0-9]*\.\([0-9]*\)\..*/\1/p')
+  bp=$(printf '%s' "$b" | sed -n 's/^v\{0,1\}[0-9]*\.[0-9]*\.\([0-9]*\).*/\1/p')
+  [ -z "$am" ] && am=0; [ -z "$aj" ] && aj=0; [ -z "$ap" ] && ap=0
+  [ -z "$bm" ] && bm=0; [ -z "$bj" ] && bj=0; [ -z "$bp" ] && bp=0
+  [ "$am" -gt "$bm" ] && return 0
+  [ "$am" -lt "$bm" ] && return 1
+  [ "$aj" -gt "$bj" ] && return 0
+  [ "$aj" -lt "$bj" ] && return 1
+  [ "$ap" -ge "$bp" ]
+}
+
 # ── 探测 Electron 版本 ─────────────────────────────────────────────────
 # 优先读发行包自带的 version 文件：纯文本读取、零进程开销，且不受环境变量
 # 污染。为什么不能只靠 `electron --version`：当 ELECTRON_RUN_AS_NODE=1 时
@@ -295,6 +327,23 @@ detect() {
     "${HOME}/.nvm/versions/node/"*/lib/node_modules/electron/dist/electron \
     "${HOME}/.dsh-desktop/runtime/"electron-*/electron \
     "$RUNTIME_DIR"/electron-*/electron || true)"
+  # 自举目录里可能同时躺着好几版（升级前 v33.3.0，升级后 v45.3.0）。glob 按
+  # 字典序展开，旧版排在前面；挑版本号最大的那个，否则 locate 会把旧版选走，
+  # 明明已经装好新版却仍被判「待升级」而下一次 180MB。
+  if [ -n "$ELECTRON_BIN" ]; then
+    local e_best="" e_ver="" ec ev
+    for ec in "$RUNTIME_DIR"/electron-*/electron "${HOME}/.dsh-desktop/runtime/"electron-*/electron; do
+      [ -x "$ec" ] || continue
+      ev="$(electron_version "$ec")"
+      if [ -z "$e_best" ] || version_ge3 "$ev" "$e_ver"; then
+        e_best="$ec"; e_ver="$ev"
+      fi
+    done
+    # 只有当自举目录里的版本比当前选中的更新时才替换
+    if [ -n "$e_best" ] && version_ge3 "$e_ver" "$(electron_version "$ELECTRON_BIN")"; then
+      ELECTRON_BIN="$e_best"
+    fi
+  fi
   # dsh 优先在「Node 所在的 bin 目录」里找：npm install -g 一定装到那个目录，
   # 这是最常见的情况（真机实测 dsh 就在 ~/.nvm/versions/node/*/bin/dsh）。
   local node_dir=""
@@ -343,7 +392,15 @@ report() {
   if [ -n "$ELECTRON_BIN" ]; then
     local v; v="$(electron_version "$ELECTRON_BIN")"
     if version_ge "$v" "v${ELECTRON_MIN_MAJOR}.0"; then
-      ok "Electron  $v   $ELECTRON_BIN"
+      # 能跑，但版本比本壳要装的那一版旧：能跑≠该用。用户拿到的是「本壳按
+      # v45 验证过」的那份，而不是碰巧还留在机器上的旧版，所以判为待升级。
+      if version_ge3 "$v" "$ELECTRON_WANT"; then
+        ok "Electron  $v   $ELECTRON_BIN"
+      else
+        info "Electron  $v   $ELECTRON_BIN  (本壳按 $ELECTRON_WANT 验证，可升级)"
+        ELECTRON_BIN=""
+        ELECTRON_OUTDATED=1
+      fi
     else
       bad "Electron  $v   $ELECTRON_BIN  (需要 ≥ v${ELECTRON_MIN_MAJOR})"
       ELECTRON_BIN=""
@@ -368,6 +425,16 @@ missing() {
   printf '%s' "${m# }"
 }
 
+# 待升级 ≠ 缺失：机器上有一个能跑的旧版本，只是不是本壳验证过的那一版。
+# 两者都触发同一条安装路径，但给人的说法要不一样——说「缺失」会让人以为
+# 从没装过，去翻安装包；说「可升级」才指得对方向。
+missing_label() {
+  if [ "${ELECTRON_OUTDATED:-0}" = "1" ]; then
+    printf 'Electron 可升级到 %s' "$ELECTRON_WANT"
+  else
+    printf '缺失：%s' "$(missing)"
+  fi
+}
 # ── 安装 ───────────────────────────────────────────────────────────────
 install_node() {
   say "下载 Node ${NODE_WANT}"
@@ -606,7 +673,7 @@ case "$cmd" in
       say "全部就绪。"
       exit 0
     fi
-    say "缺失：$m"
+    say "$(missing_label)"
     say ""
     say "执行以下命令自动下载（国内源优先）："
     say "  bash $SCRIPT_DIR/bootstrap.sh install"
@@ -634,7 +701,7 @@ case "$cmd" in
     trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
 
     require_basics || exit 1
-    say "缺失：$m —— 开始下载"
+    say "$(missing_label) —— 开始下载"
     say ""
     failed=0
     case "$m" in *electron*) install_electron || failed=1 ;; esac
@@ -658,7 +725,7 @@ case "$cmd" in
     report
     m="$(missing)"
     if [ -n "$m" ]; then
-      say "缺失：$m，先自动安装…"
+      say "$(missing_label)，先自动安装…"
       say ""
       bash "$SCRIPT_DIR/bootstrap.sh" install || exit 1
       detect

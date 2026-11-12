@@ -47,9 +47,12 @@ export const DEFAULT_NODE_VERSION = 'v24.19.0'
 /**
  * The Electron version to fetch when none is usable.
  *
+ * Electron 45 (Chromium 156, Node 24) is the current release. The shell
+ * accepts any newer major; this is the version it installs by default.
+ *
  * @type {string}
  */
-export const DEFAULT_ELECTRON_VERSION = 'v33.3.0'
+export const DEFAULT_ELECTRON_VERSION = 'v45.3.0'
 
 /**
  * A download URL for one release archive.

@@ -34,6 +34,20 @@ export const MIN_NODE_VERSION = [22, 15, 0]
 export const MIN_ELECTRON_MAJOR = 33
 
 /**
+ * The Electron release the shell was actually verified against.
+ *
+ * Distinct from `MIN_ELECTRON_MAJOR`, which is the lower bound the shell
+ * accepts: a machine may sit between the two and still run the shell, but it
+ * is then running an Electron this shell was not tested with. The lower bound
+ * is a promise to the user ("33 works"); this one is a statement of fact
+ * ("45 is what we tested"). Both are needed — conflating them either blocks
+ * users who are fine on 33, or leaves them silently on an unverified release.
+ *
+ * @type {string}
+ */
+export const WANTED_ELECTRON_VERSION = 'v45.3.0'
+
+/**
  * Chinese mirrors, tried before the upstream hosts.
  *
  * Every one of these was verified to answer; the point is speed on a mainland
@@ -90,6 +104,14 @@ export function parseVersion(text) {
   if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) return null
   return [major, minor, patch]
 }
+
+/**
+ * The wanted Electron release, pre-parsed.
+ *
+ * `parseVersion` is a hoisted function declaration, so calling it here at
+ * module scope is fine; the constant never changes, so it is parsed once.
+ */
+const WANTED_ELECTRON_PARTS = parseVersion(WANTED_ELECTRON_VERSION) ?? [0, 0, 0]
 
 /**
  * Whether `version` is at least `minimum`, compared part by part.
@@ -158,6 +180,7 @@ export function findBinary({ name, configured = null, dirs, exists }) {
  *   node: {path: string | null, version: string | null, ok: boolean},
  *   dsh: {path: string | null, version: string | null, ok: boolean},
  *   missing: string[],
+ *   electronOutdated: boolean,
  * }}
  */
 export function detectRuntime({
@@ -198,6 +221,9 @@ export function detectRuntime({
 
   const electronMajor = electronParts === null ? null : electronParts[0]
   const electronOk = electronMajor !== null && electronMajor !== undefined && electronMajor >= MIN_ELECTRON_MAJOR
+  // Usable, but older than the release the shell was verified against. Not
+  // "missing" — it runs — but the shell upgrade is only half-done without it.
+  const electronOutdated = electronOk && !meetsMinimum(electronParts, WANTED_ELECTRON_PARTS)
   const nodeOk = meetsMinimum(parseVersion(nodeVersion), MIN_NODE_VERSION)
   // Any `dsh` that runs is acceptable: the shell does not pin a kernel version,
   // and refusing a newer one would break the "use what is installed" promise.
@@ -214,6 +240,7 @@ export function detectRuntime({
     node: { path: nodePath, version: nodeVersion, ok: nodeOk },
     dsh: { path: dshPath, version: dshVersion, ok: dshOk },
     missing,
+    electronOutdated,
   }
 }
 

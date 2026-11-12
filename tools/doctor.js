@@ -22,6 +22,7 @@ import { installElectron, installNode, runtimeDir } from '../src/runtime-install
 import {
   MIN_ELECTRON_MAJOR,
   MIN_NODE_VERSION,
+  WANTED_ELECTRON_VERSION,
   detectRuntime,
   formatReport,
   meetsMinimum,
@@ -39,6 +40,11 @@ const configPath = join(repoRoot, 'config.json')
  * A `dsh` installed from npm is a JS file with a shebang, so it is run through
  * `node` when it cannot be executed directly.
  *
+ * `ELECTRON_RUN_AS_NODE` is removed from the environment for the probe: with it
+ * set, Electron runs as plain Node and `--version` answers with the bundled
+ * Node version (20.18.1 for Electron 33) rather than the Electron version, so
+ * the doctor would report a perfectly good Electron as too old — or missing.
+ *
  * @param {string} path
  * @returns {Promise<string | null>}
  */
@@ -48,9 +54,11 @@ async function versionOf(path) {
     [path, ['--version']],
     ['node', [path, '--version']],
   ]
+  const env = { ...process.env }
+  delete env.ELECTRON_RUN_AS_NODE
   for (const [command, args] of attempts) {
     try {
-      const { stdout } = await run(command, args, { timeout: 15_000, encoding: 'utf8' })
+      const { stdout } = await run(command, args, { timeout: 15_000, encoding: 'utf8', env })
       const text = String(stdout).trim()
       if (text !== '') return text
     } catch {
@@ -87,6 +95,10 @@ async function inspect(launcher) {
   report.missing = ['electron', 'node', 'dsh'].filter(
     (kind) => report[/** @type {'electron'|'node'|'dsh'} */ (kind)].ok === false,
   )
+  // `detectRuntime` could not read versions (the probe runs here), so the
+  // outdated verdict is recomputed from the versions it learned.
+  report.electronOutdated =
+    report.electron.ok && !meetsMinimum(parseVersion(report.electron.version), parseVersion(WANTED_ELECTRON_VERSION) ?? [0, 0, 0])
 
   return report
 }
@@ -101,12 +113,16 @@ async function main() {
   for (const line of formatReport(report)) console.log(`  ${line}`)
   console.log()
 
-  if (report.missing.length === 0) {
+  if (report.missing.length === 0 && !report.electronOutdated) {
     console.log('全部就绪，无需下载。')
     return
   }
 
-  console.log(`缺失：${report.missing.join('、')}`)
+  if (report.missing.length === 0) {
+    console.log(`Electron ${report.electron.version} 可用，但低于本壳验证过的 ${WANTED_ELECTRON_VERSION}。`)
+  } else {
+    console.log(`缺失：${report.missing.join('、')}`)
+  }
   if (!install) {
     console.log()
     console.log('加 --install 自动下载并写回 config.json：')
@@ -132,7 +148,7 @@ async function main() {
    */
   const exec = async (command, args, options) => run(command, args, options)
 
-  if (!report.electron.ok) {
+  if (!report.electron.ok || report.electronOutdated) {
     console.log(`下载 Electron 到 ${runtimeDir()} …`)
     updates.electron = await installElectron({ exec, log })
   }
